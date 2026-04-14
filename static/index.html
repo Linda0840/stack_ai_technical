@@ -263,11 +263,62 @@
       background: #f8f9ff;
       border: 1px solid #dce2fd;
       border-radius: 10px;
-      padding: 16px;
+      padding: 18px 20px;
       font-size: .9rem;
-      line-height: 1.7;
-      white-space: pre-wrap;
+      line-height: 1.75;
       color: var(--text);
+    }
+    /* Markdown elements rendered inside the answer box */
+    .answer-box p          { margin-bottom: .75em; }
+    .answer-box p:last-child { margin-bottom: 0; }
+    .answer-box h1, .answer-box h2, .answer-box h3,
+    .answer-box h4, .answer-box h5, .answer-box h6 {
+      font-weight: 700; margin: 1em 0 .35em;
+      line-height: 1.3; color: var(--text);
+    }
+    .answer-box h1 { font-size: 1.15rem; }
+    .answer-box h2 { font-size: 1.05rem; }
+    .answer-box h3 { font-size: .97rem; }
+    .answer-box h4, .answer-box h5, .answer-box h6 { font-size: .9rem; }
+    .answer-box ul, .answer-box ol {
+      padding-left: 1.4em; margin-bottom: .75em;
+    }
+    .answer-box li { margin-bottom: .25em; }
+    .answer-box strong { font-weight: 700; }
+    .answer-box em     { font-style: italic; }
+    .answer-box code {
+      background: #e8ecfd; border-radius: 4px;
+      padding: 1px 5px; font-size: .85em; font-family: monospace;
+    }
+    .answer-box pre {
+      background: #1e2235; color: #e2e8f0;
+      border-radius: 8px; padding: 12px 14px;
+      overflow-x: auto; font-size: .83rem;
+      margin-bottom: .75em;
+    }
+    .answer-box pre code { background: none; padding: 0; color: inherit; }
+    .answer-box table {
+      width: 100%; border-collapse: collapse;
+      margin-bottom: .75em; font-size: .86rem;
+    }
+    .answer-box th {
+      background: #eef1fe; color: var(--primary);
+      font-weight: 700; text-align: left;
+      padding: 7px 10px; border: 1px solid #c7d2fe;
+    }
+    .answer-box td {
+      padding: 6px 10px; border: 1px solid #dce2fd;
+      vertical-align: top;
+    }
+    .answer-box tr:nth-child(even) td { background: #f4f6fe; }
+    .answer-box blockquote {
+      border-left: 3px solid var(--primary);
+      margin: 0 0 .75em; padding: 4px 12px;
+      color: var(--muted); font-style: italic;
+    }
+    .answer-box hr {
+      border: none; border-top: 1px solid var(--border);
+      margin: .75em 0;
     }
     .sources-title {
       font-size: .78rem;
@@ -322,6 +373,48 @@
     /* ── Divider ── */
     .divider { border: none; border-top: 1px solid var(--border); }
 
+    /* ── Knowledge-base disclosure panel ── */
+    .kb-toggle {
+      display: flex; align-items: center; gap: 7px;
+      background: none; border: none; cursor: pointer;
+      font-size: .82rem; font-weight: 600;
+      color: var(--muted); padding: 0;
+      user-select: none; width: 100%;
+      transition: color .15s;
+    }
+    .kb-toggle:hover { color: var(--primary); }
+    .kb-toggle .chevron { transition: transform .22s ease; flex-shrink: 0; }
+    .kb-toggle[aria-expanded="true"] .chevron { transform: rotate(90deg); }
+    .kb-toggle .kb-badge {
+      margin-left: auto;
+      background: #eef1fe; color: var(--primary);
+      border-radius: 20px; padding: 1px 9px;
+      font-size: .74rem; font-weight: 700;
+    }
+    .kb-body {
+      display: none; flex-direction: column; gap: 6px;
+      background: #f8f9ff; border: 1px solid #dce2fd;
+      border-radius: 10px; padding: 12px 14px;
+    }
+    .kb-body.open { display: flex; }
+    .kb-empty {
+      font-size: .82rem; color: var(--muted);
+      text-align: center; padding: 4px 0;
+    }
+    .kb-file-row {
+      display: flex; align-items: center; gap: 8px;
+      font-size: .82rem; padding: 5px 0;
+      border-bottom: 1px solid #e8ecfd;
+    }
+    .kb-file-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .kb-file-row .kb-fname {
+      flex: 1; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; color: var(--text); font-weight: 500;
+    }
+    .kb-file-row .kb-meta {
+      white-space: nowrap; color: var(--muted); font-size: .76rem;
+    }
+
     footer {
       text-align: center;
       font-size: .78rem;
@@ -331,6 +424,7 @@
       margin-top: auto;
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 </head>
 <body>
 
@@ -365,6 +459,18 @@
         <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
       </svg>
       <span id="session-status-text">Loading session…</span>
+    </div>
+
+    <!-- ── Knowledge-base file list (collapsible) ── -->
+    <button class="kb-toggle" id="kb-toggle" aria-expanded="false" aria-controls="kb-body">
+      <svg class="chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 18 15 12 9 6"/>
+      </svg>
+      Knowledge Base
+      <span class="kb-badge" id="kb-badge">0 files</span>
+    </button>
+    <div class="kb-body" id="kb-body" role="region" aria-live="polite">
+      <div class="kb-empty" id="kb-empty">No files uploaded yet.</div>
     </div>
 
     <div class="instructions">
@@ -498,6 +604,10 @@
   const sessionStatusT = document.getElementById('session-status-text');
   const clearBtn       = document.getElementById('clear-btn');
   const clearResult    = document.getElementById('clear-result');
+  const kbToggle       = document.getElementById('kb-toggle');
+  const kbBody         = document.getElementById('kb-body');
+  const kbBadge        = document.getElementById('kb-badge');
+  const kbEmpty        = document.getElementById('kb-empty');
 
   const queryInput  = document.getElementById('query-input');
   const charCount   = document.getElementById('char-count');
@@ -510,19 +620,53 @@
   const sourcesList = document.getElementById('sources-list');
 
   // ══════════════════════════════════════
-  //  SESSION STATUS
+  //  SESSION STATUS + KB FILE LIST
   // ══════════════════════════════════════
+
+  function relTime(isoStr) {
+    const diff = Math.floor((Date.now() - new Date(isoStr + 'Z').getTime()) / 1000);
+    if (diff < 5)     return 'just now';
+    if (diff < 3600)  return `${Math.floor(diff / 60) || 1} min ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} hr ago`;
+    return `${Math.floor(diff / 86400)} d ago`;
+  }
+
+  function renderKbFiles(documents) {
+    // Remove old file rows (keep #kb-empty in the DOM)
+    kbBody.querySelectorAll('.kb-file-row').forEach(el => el.remove());
+
+    if (!documents || documents.length === 0) {
+      kbEmpty.style.display = 'block';
+      return;
+    }
+    kbEmpty.style.display = 'none';
+
+    documents.forEach(doc => {
+      const row = document.createElement('div');
+      row.className = 'kb-file-row';
+      row.innerHTML = `
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#4f6ef7" stroke-width="2" stroke-linecap="round" flex-shrink="0">
+          <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+        <span class="kb-fname" title="${doc.filename}">${doc.filename}</span>
+        <span class="kb-meta">${doc.chunk_count} chunk${doc.chunk_count !== 1 ? 's' : ''} · ${relTime(doc.uploaded_at)}</span>`;
+      kbBody.appendChild(row);
+    });
+  }
 
   async function loadSessionStatus() {
     try {
-      const res  = await fetch(`${API_BASE}/health`);
+      const res  = await fetch(`${API_BASE}/api/v1/ingest`);
       if (!res.ok) return;
-      const data = await res.json();
-      currentFileCount = data.documents_indexed || 0;
+      const data = await res.json();          // DocumentListResponse
+      currentFileCount = data.total_documents || 0;
+      renderKbFiles(data.documents || []);
     } catch (_) {
       return;
     }
     const n = currentFileCount;
+    kbBadge.textContent = `${n} file${n === 1 ? '' : 's'}`;
     if (n === 0) {
       sessionStatus.className    = 'session-status empty';
       sessionStatusT.textContent = 'No files in this session — upload a PDF to get started.';
@@ -531,6 +675,12 @@
       sessionStatusT.textContent = `${n} file${n === 1 ? '' : 's'} in the current session`;
     }
   }
+
+  // KB toggle
+  kbToggle.addEventListener('click', () => {
+    const isOpen = kbBody.classList.toggle('open');
+    kbToggle.setAttribute('aria-expanded', isOpen);
+  });
 
   // ══════════════════════════════════════
   //  FILE UPLOAD SECTION
@@ -727,7 +877,7 @@
 
       if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
 
-      answerText.textContent = data.answer || '(No answer returned.)';
+      answerText.innerHTML = marked.parse(data.answer || '(No answer returned.)');
 
       sourcesList.innerHTML = '';
       if (data.sources && data.sources.length) {

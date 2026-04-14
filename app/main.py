@@ -32,6 +32,11 @@ async def lifespan(app: FastAPI):
 
     # keyword
     app.state.bm25_index: dict = {}    # chunk_id -> token list
+
+    # lightweight upload log: list of {document_id, filename, uploaded_at}
+    # accumulates across multiple upload batches in the same session
+    app.state.document_registry: list = []
+
     logger.info("In-memory stores initialised.")
     yield
     logger.info("Shutting down.")

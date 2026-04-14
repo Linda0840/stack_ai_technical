@@ -27,11 +27,91 @@ settings = get_settings()
 
 
 NO_SEARCH_ANSWER = "Hello! How can I help you today?"
+EMPTY_KB_ANSWER = (
+    "The current knowledge base is empty. "
+    "Please upload at least one PDF file first."
+)
 INSUFFICIENT_EVIDENCE_ANSWER = (
     "I could not find sufficiently relevant information in the indexed documents "
     "to answer your question confidently. Please try rephrasing, or upload "
     "documents that cover this topic."
 )
+
+
+# ── Answer-shaping: intent → format template ──────────────────────────────────
+#
+# Patterns are checked in order; the first match wins.
+# "table" is before "comparison" so "compare in a table" → table, not comparison.
+# "list" is before "definition" so "list what X is" → list, not definition.
+_SHAPE_PATTERNS: list[tuple[str, str]] = [
+    (r"\b(table|tabulate|tabular|spreadsheet)\b",                               "table"),
+    (r"\b(compar|contrast|difference|similarities|vs\.?|versus)\b",             "comparison"),
+    (r"\b(list|enumerate|bullet|itemize|what are|give me all|name all)\b",      "list"),
+    (r"\b(how\s+to|how\s+do\s+i|steps?\s+(to|for)|guide\s+(to|for)|"
+     r"walk\s+me\s+through|instructions?\s+(for|to))\b",                        "instruction"),
+    (r"\b(what\s+is|what\s+are|define|definition\s+of|"
+     r"meaning\s+of|explain\s+what)\b",                                         "definition"),
+]
+
+_PROMPT_TEMPLATES: dict[str, str] = {
+    "list": (
+        "You are a careful assistant. Answer using ONLY the provided context.\n"
+        "Format your answer as a markdown bulleted list (- item).\n"
+        "Every bullet must end with a citation in the form (filename, p.N).\n"
+        "If the context is insufficient, say so briefly instead of guessing."
+    ),
+    "table": (
+        "You are a careful assistant. Answer using ONLY the provided context.\n"
+        "Format your answer as a markdown table with a clear header row.\n"
+        "Include a 'Source' column that cites filename and page number for each row.\n"
+        "If the context is insufficient, say so briefly instead of guessing."
+    ),
+    "comparison": (
+        "You are a careful assistant. Answer using ONLY the provided context.\n"
+        "Format your answer as a markdown comparison table: items to compare as "
+        "columns, attributes as rows.\n"
+        "Follow the table with a one-paragraph prose summary.\n"
+        "Cite sources by filename and page. "
+        "If the context is insufficient, say so briefly instead of guessing."
+    ),
+    "definition": (
+        "You are a careful assistant. Answer using ONLY the provided context.\n"
+        "Give a concise definition in one or two sentences, then add a short "
+        "elaborating paragraph if the context supports it.\n"
+        "Cite sources by filename and page. "
+        "If the context is insufficient, say so briefly instead of guessing."
+    ),
+    "instruction": (
+        "You are a careful assistant. Answer using ONLY the provided context.\n"
+        "Format your answer as a numbered step-by-step list. "
+        "Each step must be a single, clear action sentence.\n"
+        "Cite sources by filename and page at the end of the list.\n"
+        "If the context is insufficient, say so briefly instead of guessing."
+    ),
+    "factual": (
+        "You are a careful assistant. Answer using only the provided context. "
+        "If the context is insufficient, say so briefly. "
+        "Cite sources by filename and page when you use them."
+    ),
+}
+
+
+def _classify_query_shape(query: str) -> str:
+    """
+    Classify a query into a formatting shape using regex heuristics.
+
+    Returns one of: 'list', 'table', 'comparison', 'definition',
+    'instruction', 'factual' (default).
+
+    No LLM call is made — this runs entirely locally so it adds zero latency
+    to the pipeline.  The patterns are ordered from most-specific to least so
+    an earlier match always takes precedence.
+    """
+    q = query.lower()
+    for pattern, shape in _SHAPE_PATTERNS:
+        if re.search(pattern, q):
+            return shape
+    return "factual"
 
 
 def _tokenize(s: str) -> list[str]:
@@ -164,6 +244,16 @@ class QueryService:
 
 
    async def handle_query(self, request: QueryRequest) -> QueryResponse:
+       # Short-circuit before any LLM call when nothing has been ingested yet.
+       if not self._vector_store:
+           return QueryResponse(
+               query=request.query,
+               intent_triggered_search=False,
+               evidence_sufficient=False,
+               answer=EMPTY_KB_ANSWER,
+               sources=[],
+           )
+
        triggered = await self._detect_intent(request.query)
 
        if not triggered:
@@ -198,14 +288,21 @@ class QueryService:
                sources=[],
            )
 
+       # Classify the output format from the *original* query (before transformation
+       # rewrites it for retrieval) so structural cues like "list" or "compare" are
+       # still present when the shape is determined.
+       shape = _classify_query_shape(request.query)
+       logger.debug("Query shape: %s  query=%r", shape, request.query)
+
        reranked = await self._rerank(request.query, chunks, request.top_k)
-       answer = await self._generate(request.query, reranked)
+       answer = await self._generate(request.query, reranked, shape)
 
        return QueryResponse(
            query=request.query,
            transformed_query=transformed,
            intent_triggered_search=True,
            evidence_sufficient=True,
+           query_shape=shape,
            answer=answer,
            sources=reranked,
        )
@@ -236,8 +333,14 @@ class QueryService:
                messages=[
                    SystemMessage(
                        content=(
-                           "Decide if the user wants document-grounded search or only "
-                           "casual chat. Reply with exactly one token: SEARCH or CHITCHAT."
+                           "Classify the user message as SEARCH or CHITCHAT.\n"
+                           "CHITCHAT: greetings, farewells, thanks, or pure social "
+                           "pleasantries with no informational intent "
+                           "(e.g. 'hello', 'thanks', 'how are you').\n"
+                           "SEARCH: every other message — any question, request for "
+                           "information, or topic-related statement, regardless of "
+                           "whether the answer exists in a knowledge base.\n"
+                           "Reply with exactly one word: SEARCH or CHITCHAT."
                        )
                    ),
                    UserMessage(content=f"User message:\n{query}"),
@@ -482,9 +585,20 @@ class QueryService:
        ]
 
     # Mistral chat with system + user context; handles empty chunks and API failure with clear messages
-   async def _generate(self, query: str, chunks: list[RetrievedChunk]) -> str:
+   async def _generate(
+       self, query: str, chunks: list[RetrievedChunk], shape: str = "factual"
+   ) -> str:
        """
        Build a prompt from retrieved context and call Mistral to generate an answer.
+
+       The ``shape`` parameter selects a prompt template that steers the model
+       toward the output format most appropriate for the query type:
+         list        → markdown bulleted list with per-bullet citations
+         table       → markdown table with a Source column
+         comparison  → side-by-side markdown table + prose summary
+         definition  → concise definition paragraph
+         instruction → numbered step-by-step list
+         factual     → free-form prose (default)
        """
        if not chunks:
            return "I could not find relevant information in the indexed documents."
@@ -494,11 +608,7 @@ class QueryService:
        context = "\n\n".join(
            f"[Source: {c.filename}, p.{c.page_number}]\n{c.text[:max_ctx_chars]}" for c in chunks
        )
-       system = (
-           "You are a careful assistant. Answer using only the provided context. "
-           "If the context is insufficient, say so briefly. Cite sources by filename "
-           "and page when you use them."
-       )
+       system = _PROMPT_TEMPLATES.get(shape, _PROMPT_TEMPLATES["factual"])
        user = f"Context:\n{context}\n\nQuestion: {query}"
 
        def _call() -> str:

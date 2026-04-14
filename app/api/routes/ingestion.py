@@ -12,13 +12,19 @@
 
 
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
-
 from app.core.config import get_settings
-from app.models.schemas import IngestResponse # response is typed with IngestResponse
-from app.services.ingestion import IngestionService # injection logic
-from app.api.deps import get_ingestion_service, get_vector_store, get_bm25_index
+from app.models.schemas import DocumentInfo, DocumentListResponse, IngestResponse
+from app.services.ingestion import IngestionService
+from app.api.deps import (
+    get_document_registry,
+    get_ingestion_service,
+    get_vector_store,
+    get_bm25_index,
+)
 
 
 router = APIRouter(prefix="/ingest", tags=["Ingestion"])
@@ -27,6 +33,45 @@ _settings = get_settings()
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
 
 
+
+
+@router.get(
+   "",
+   response_model=DocumentListResponse,
+   status_code=status.HTTP_200_OK,
+   summary="List all documents indexed in the current session",
+)
+async def list_documents(
+   registry: list = Depends(get_document_registry),
+   vector_store: dict = Depends(get_vector_store),
+) -> DocumentListResponse:
+   """
+   Returns every file that has been uploaded and indexed since the server
+   started (or since the knowledge base was last cleared).  Multiple upload
+   batches in the same session are accumulated here.
+   """
+   # Count chunks per document_id directly from the live vector store so the
+   # numbers are always accurate even if a future operation removes chunks.
+   chunk_counts: dict[str, int] = {}
+   for entry in vector_store.values():
+       if "chunk" in entry:
+           doc_id = entry["chunk"].document_id
+           chunk_counts[doc_id] = chunk_counts.get(doc_id, 0) + 1
+
+   documents = [
+       DocumentInfo(
+           document_id=rec["document_id"],
+           filename=rec["filename"],
+           chunk_count=chunk_counts.get(rec["document_id"], 0),
+           uploaded_at=rec["uploaded_at"],
+       )
+       for rec in registry
+   ]
+   return DocumentListResponse(
+       documents=documents,
+       total_documents=len(documents),
+       total_chunks=sum(d.chunk_count for d in documents),
+   )
 
 
 @router.post(
@@ -38,6 +83,7 @@ ALLOWED_CONTENT_TYPES = {"application/pdf"}
 async def ingest_documents(
    files: list[UploadFile] = File(..., description="One or more PDF files to ingest"),
    service: IngestionService = Depends(get_ingestion_service),
+   registry: list = Depends(get_document_registry),
 ) -> IngestResponse:
    """
    Accepts one or more PDF files, extracts and chunks their text, generates
@@ -85,6 +131,16 @@ async def ingest_documents(
            ),
        )
 
+   # Record each file in the session registry.
+   # document_ids are returned in the same order as files by ingest_files.
+   uploaded_at = datetime.utcnow()
+   for doc_id, f in zip(document_ids, files):
+       registry.append({
+           "document_id": doc_id,
+           "filename": f.filename,
+           "uploaded_at": uploaded_at,
+       })
+
    return IngestResponse(
        document_ids=document_ids,
        total_chunks=total_chunks,
@@ -101,12 +157,14 @@ async def ingest_documents(
 async def clear_documents(
    vector_store: dict = Depends(get_vector_store),
    bm25_index: dict  = Depends(get_bm25_index),
+   registry: list    = Depends(get_document_registry),
 ) -> dict:
-   """Remove every indexed chunk from the in-memory vector store and BM25 index."""
-   doc_ids = {v["chunk"].document_id for v in vector_store.values() if "chunk" in v}
-   removed = len(doc_ids)
+   """Remove every indexed chunk from the in-memory vector store, BM25 index,
+   and session document registry."""
+   removed = len(registry)
    vector_store.clear()
    bm25_index.clear()
+   registry.clear()
    return {
        "message": f"Knowledge base cleared. {removed} document(s) removed.",
        "documents_removed": removed,

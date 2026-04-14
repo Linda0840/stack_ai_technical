@@ -50,6 +50,36 @@ def _tokenize(s: str) -> list[str]:
    return re.findall(r"[a-z0-9]+", s.lower())
 
 
+def _tokenize_filename(filename: str) -> list[str]:
+   """
+   Produce BM25 tokens from a filename with letter-digit boundary splitting.
+
+   Without this, 'Lecture1' in a filename is a single token that never matches
+   the query tokens ['lecture', '1'] from 'can you summarize lecture 1?'.
+
+   Examples
+   --------
+   '2026_C51_Lecture1_overview_hardcopy.pdf'
+       → ['2026', 'c', '51', 'lecture', '1', 'overview', 'hardcopy']
+   '15.C51-2026-lecture02.pdf'
+       → ['15', 'c', '51', '2026', 'lecture', '02']
+   """
+   stem = filename.rsplit(".", 1)[0]                   # drop extension
+   stem = re.sub(r"[_\-\.]+", " ", stem)              # separators → space
+   stem = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", stem)  # Lecture1  → Lecture 1
+   stem = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", stem)  # 2Intro    → 2 Intro
+   return re.findall(r"[a-z0-9]+", stem.lower())
+
+
+def _filename_label(filename: str) -> str:
+   """Human-readable label used as a context prefix when embedding chunks."""
+   stem = filename.rsplit(".", 1)[0]
+   stem = re.sub(r"[_\-\.]+", " ", stem)
+   stem = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", stem)
+   stem = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", stem)
+   return stem.strip()
+
+
 class IngestionService:
    def __init__(self, vector_store: dict, bm25_index: dict):
        # Injected shared stores (populated at startup via lifespan)
@@ -339,7 +369,9 @@ class IngestionService:
            placeholder = [0.0] * _MISTRAL_EMBED_DIM
            for chunk in chunks:
                self._vector_store[chunk.chunk_id] = {"chunk": chunk, "embedding": placeholder}
-               self._bm25_index[chunk.chunk_id]   = _tokenize(chunk.text)
+               self._bm25_index[chunk.chunk_id]   = (
+                   _tokenize(chunk.text) + _tokenize_filename(chunk.filename)
+               )
            logger.info("[embed] stored %d placeholder chunks — to use real embeddings set EMBED_MODE=real", len(chunks))
            return
 
@@ -351,8 +383,14 @@ class IngestionService:
 
        for i in range(0, len(chunks), batch_size):
            batch = chunks[i : i + batch_size]
-           # Capture texts in default arg to avoid loop-closure pitfall
-           batch_texts = [c.text for c in batch]
+           # Prepend a filename context line so the embedding captures which
+           # document the chunk belongs to.  This helps semantic search
+           # distinguish e.g. "Lecture 1" from "Lecture 2" when the body text
+           # of a file never explicitly mentions its own name.
+           batch_texts = [
+               f"[Document: {_filename_label(c.filename)}]\n{c.text}"
+               for c in batch
+           ]
 
            def _call_embed(texts=batch_texts) -> object:
                return client.embeddings.create(
@@ -405,6 +443,8 @@ class IngestionService:
            ]
            for chunk, embedding in zip(batch, embeddings):
                self._vector_store[chunk.chunk_id] = {"chunk": chunk, "embedding": embedding}
-               self._bm25_index[chunk.chunk_id]   = _tokenize(chunk.text)
+               self._bm25_index[chunk.chunk_id]   = (
+                   _tokenize(chunk.text) + _tokenize_filename(chunk.filename)
+               )
 
        logger.info("[embed] done — stored %d chunks in vector/BM25 stores", len(chunks))
