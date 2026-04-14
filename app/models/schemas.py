@@ -41,6 +41,10 @@ class QueryResponse(BaseModel):
     query: str
     transformed_query: Optional[str] = None
     intent_triggered_search: bool
+    # None  → search was not triggered (chitchat / greeting)
+    # False → search triggered but no chunk met the similarity threshold
+    # True  → search triggered and at least one chunk passed the threshold
+    evidence_sufficient: Optional[bool] = None
     answer: str
     sources: list[RetrievedChunk]
     created_at: datetime = Field(default_factory=datetime.utcnow)

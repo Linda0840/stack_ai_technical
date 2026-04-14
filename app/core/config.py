@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     # Maximum chunks forwarded to the LLM reranker (subset of retrieve_k).
     max_rerank_chunks: int = 25
 
+    # ── Evidence threshold ────────────────────────────────────────────────────
+    # Minimum hybrid score (0.0–1.0) that at least one retrieved chunk must reach.
+    # The hybrid score = semantic_weight * cosine_similarity + keyword_weight * bm25.
+    # If the best chunk falls below this value the pipeline refuses to generate an
+    # answer and returns "insufficient evidence" instead.
+    # Set to 0.0 via env (MIN_SIMILARITY_THRESHOLD=0) to disable the guard.
+    min_similarity_threshold: float = 0.25
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

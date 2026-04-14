@@ -27,6 +27,11 @@ settings = get_settings()
 
 
 NO_SEARCH_ANSWER = "Hello! How can I help you today?"
+INSUFFICIENT_EVIDENCE_ANSWER = (
+    "I could not find sufficiently relevant information in the indexed documents "
+    "to answer your question confidently. Please try rephrasing, or upload "
+    "documents that cover this topic."
+)
 
 
 def _tokenize(s: str) -> list[str]:
@@ -161,7 +166,6 @@ class QueryService:
    async def handle_query(self, request: QueryRequest) -> QueryResponse:
        triggered = await self._detect_intent(request.query)
 
-
        if not triggered:
            return QueryResponse(
                query=request.query,
@@ -170,17 +174,38 @@ class QueryService:
                sources=[],
            )
 
-
        transformed = await self._transform_query(request.query)
        chunks = await self._hybrid_search(transformed, request.top_k)
+
+       # ── Evidence threshold guard ─────────────────────────────────────────
+       # Refuse to generate an answer when the knowledge base contains nothing
+       # relevant enough.  Checking the max hybrid score here (before reranking)
+       # avoids two unnecessary LLM calls when the index simply doesn't cover
+       # the topic.  The hybrid score ∈ [0, 1] combines cosine similarity and
+       # normalised BM25, so a low ceiling means both signals are weak.
+       best_score = max((c.score for c in chunks), default=0.0)
+       if best_score < settings.min_similarity_threshold:
+           logger.info(
+               "Insufficient evidence: best_score=%.4f < threshold=%.4f  query=%r",
+               best_score, settings.min_similarity_threshold, request.query,
+           )
+           return QueryResponse(
+               query=request.query,
+               transformed_query=transformed,
+               intent_triggered_search=True,
+               evidence_sufficient=False,
+               answer=INSUFFICIENT_EVIDENCE_ANSWER,
+               sources=[],
+           )
+
        reranked = await self._rerank(request.query, chunks, request.top_k)
        answer = await self._generate(request.query, reranked)
-
 
        return QueryResponse(
            query=request.query,
            transformed_query=transformed,
            intent_triggered_search=True,
+           evidence_sufficient=True,
            answer=answer,
            sources=reranked,
        )
