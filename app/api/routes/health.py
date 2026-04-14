@@ -31,7 +31,7 @@ async def health(
 ) -> HealthResponse:
    settings = get_settings()
    # Count unique document IDs currently indexed
-   doc_ids = {v["chunk"]["document_id"] for v in vector_store.values() if "chunk" in v}
+   doc_ids = {v["chunk"].document_id for v in vector_store.values() if "chunk" in v}
    return HealthResponse(
        status="ok",
        version=settings.app_version,

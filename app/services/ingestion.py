@@ -25,9 +25,11 @@ Considerations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from io import BytesIO
 
+import pdfplumber
 from pypdf import PdfReader
 from mistralai.client import Mistral
 
@@ -38,7 +40,10 @@ from app.models.schemas import DocumentChunk
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_EMBED_BATCH_SIZE = 64
+# Dimension of the Mistral embed model; used for placeholder vectors in debug mode.
+_MISTRAL_EMBED_DIM = 1024
+# Maximum loop iterations per page during chunking; guards against infinite loops.
+_MAX_CHUNKS_PER_PAGE = 2000
 
 
 def _tokenize(s: str) -> list[str]:
@@ -62,22 +67,83 @@ class IngestionService:
        """
        Accept a list of UploadFile objects, extract text, chunk, embed and index.
        Returns (document_ids, total_chunks).
+
+       Scalability strategy
+       --------------------
+       Phase 1 (read → extract → chunk) runs concurrently for all files via
+       asyncio.gather.  PDF parsing is CPU-bound so each file's _extract_text call
+       is offloaded to a thread (asyncio.to_thread) so it never blocks the event
+       loop.
+
+       Phase 2 (embed → store) is kept sequential per-batch to respect Mistral
+       rate limits; all chunks are submitted in a single _embed_and_store call so
+       the batch size setting still applies globally across all files.
        """
-       document_ids: list[str] = []
-       total_chunks = 0
+       pipeline_start = time.monotonic()
+       max_bytes = settings.max_file_size_mb * 1024 * 1024
 
-       for upload_file in files:
+       async def _prepare(upload_file) -> tuple[str, str, list]:
+           """Read, validate size, extract text, and chunk one file."""
+           fname = upload_file.filename
            doc_id = str(uuid.uuid4())
+           logger.info("[ingest] ── START %s (doc_id=%s)", fname, doc_id)
+
+           # ── Step 1: read ─────────────────────────────────────────────
+           t0 = time.monotonic()
            raw_bytes = await upload_file.read()
-           pages = self._extract_text(raw_bytes, upload_file.filename)
-           chunks = self._chunk_pages(pages, doc_id, upload_file.filename)
-           await self._embed_and_store(chunks)
+           logger.info("[ingest] step=read   file=%s  bytes=%d  elapsed=%.3fs",
+                       fname, len(raw_bytes), time.monotonic() - t0)
+
+           # ── Size guard ───────────────────────────────────────────────
+           if len(raw_bytes) > max_bytes:
+               raise ValueError(
+                   f"'{fname}' is {len(raw_bytes) // (1024*1024)} MB, "
+                   f"which exceeds the {settings.max_file_size_mb} MB per-file limit."
+               )
+
+           # ── Step 2: extract (offloaded to thread pool) ───────────────
+           t0 = time.monotonic()
+           pages = await asyncio.to_thread(self._extract_text, raw_bytes, fname)
+           total_chars = sum(len(t) for _, t in pages)
+           logger.info("[ingest] step=extract file=%s  pages=%d  chars=%d  elapsed=%.3fs",
+                       fname, len(pages), total_chars, time.monotonic() - t0)
+
+           # ── Step 3: chunk ────────────────────────────────────────────
+           t0 = time.monotonic()
+           chunks = self._chunk_pages(pages, doc_id, fname)
+           logger.info("[ingest] step=chunk  file=%s  chunks=%d  elapsed=%.3fs",
+                       fname, len(chunks), time.monotonic() - t0)
+
+           return doc_id, fname, chunks
+
+       # ── Phase 1: all files in parallel ───────────────────────────────────
+       results = await asyncio.gather(
+           *[_prepare(f) for f in files],
+           return_exceptions=True,
+       )
+
+       # Propagate the first error (e.g. size violation) as a plain exception so
+       # the route layer can convert it to an appropriate HTTP response.
+       for result in results:
+           if isinstance(result, Exception):
+               raise result
+
+       # ── Phase 2: collect all chunks, embed in one sequential pass ─────────
+       document_ids: list[str] = []
+       all_chunks: list = []
+       for doc_id, fname, chunks in results:  # type: ignore[misc]
            document_ids.append(doc_id)
-           total_chunks += len(chunks)
-           logger.info("Ingested %s → %d chunks (doc_id=%s)", upload_file.filename, len(chunks), doc_id)
+           all_chunks.extend(chunks)
+           logger.info("[ingest] queued %d chunks from %s", len(chunks), fname)
 
+       t0 = time.monotonic()
+       await self._embed_and_store(all_chunks)
+       logger.info(
+           "[ingest] embed+store: %d total chunks  elapsed=%.3fs  total_pipeline=%.3fs",
+           len(all_chunks), time.monotonic() - t0, time.monotonic() - pipeline_start,
+       )
 
-       return document_ids, total_chunks
+       return document_ids, len(all_chunks)
 
 
    # ------------------------------------------------------------------
@@ -89,29 +155,62 @@ class IngestionService:
        """
        Extract text from PDF bytes.
        Returns list of (page_number, page_text).
+
+       Strategy: try pdfplumber first (handles more font/layout types); fall back
+       to pypdf if pdfplumber yields no usable text across all pages.
        """
        logger.debug("_extract_text called for %s (%d bytes)", filename, len(raw_bytes))
        if not raw_bytes:
            return [(1, "")]
 
+       pages = self._extract_with_pdfplumber(raw_bytes, filename)
+       total_chars = sum(len(t) for _, t in pages)
+
+       if total_chars < 50:
+           logger.info(
+               "pdfplumber yielded only %d chars for %s; falling back to pypdf.",
+               total_chars, filename,
+           )
+           pages = self._extract_with_pypdf(raw_bytes, filename)
+           total_chars = sum(len(t) for _, t in pages)
+
+       logger.info("_extract_text: %d pages, %d total chars from %s", len(pages), total_chars, filename)
+       return pages if pages else [(1, "")]
+
+
+   def _extract_with_pdfplumber(self, raw_bytes: bytes, filename: str) -> list[tuple[int, str]]:
+       """Use pdfplumber for text extraction (robust with most font/layout types)."""
+       pages: list[tuple[int, str]] = []
+       try:
+           with pdfplumber.open(BytesIO(raw_bytes)) as pdf:
+               for i, page in enumerate(pdf.pages, start=1):
+                   try:
+                       text = page.extract_text() or ""
+                   except Exception as exc:
+                       logger.debug("pdfplumber page %d failed for %s: %s", i, filename, exc)
+                       text = ""
+                   pages.append((i, text))
+       except Exception as exc:
+           logger.warning("pdfplumber open failed for %s: %s", filename, exc)
+       return pages
+
+
+   def _extract_with_pypdf(self, raw_bytes: bytes, filename: str) -> list[tuple[int, str]]:
+       """Use pypdf for text extraction (fallback)."""
+       pages: list[tuple[int, str]] = []
        try:
            reader = PdfReader(BytesIO(raw_bytes))
        except Exception as exc:
-           logger.warning("PDF read failed for %s: %s", filename, exc)
+           logger.warning("pypdf read failed for %s: %s", filename, exc)
            return [(1, "")]
-
-       pages: list[tuple[int, str]] = []
        for i, page in enumerate(reader.pages, start=1):
            try:
                text = page.extract_text() or ""
            except Exception as exc:
-               logger.debug("extract_text failed page %d %s: %s", i, filename, exc)
+               logger.debug("pypdf page %d failed for %s: %s", i, filename, exc)
                text = ""
            pages.append((i, text))
-
-       if not pages:
-           return [(1, "")]
-       return pages
+       return pages if pages else [(1, "")]
 
 
    def _chunk_end_with_sentence_preference(
@@ -171,7 +270,17 @@ class IngestionService:
            if not text:
                continue
            start = 0
+           iters = 0
            while start < len(text):
+               iters += 1
+               if iters > _MAX_CHUNKS_PER_PAGE:
+                   logger.error(
+                       "[chunk] safety-break after %d iterations on page %d of %s "
+                       "(start=%d, len=%d) — possible infinite loop, skipping rest of page",
+                       iters, page_num, filename, start, len(text),
+                   )
+                   break
+
                end = self._chunk_end_with_sentence_preference(
                    text, start, settings.chunk_size, min_chunk
                )
@@ -195,57 +304,107 @@ class IngestionService:
                next_start = end - settings.chunk_overlap
                start = max(start + 1, next_start)
 
+           logger.debug("[chunk] page=%d  iters=%d  chunks_so_far=%d", page_num, iters, len(chunks))
+
        return chunks
 
 
    async def _embed_and_store(self, chunks: list[DocumentChunk]) -> None:
        """
        Call Mistral embedding API, store vectors + BM25 tokens.
-       Batches inputs to reduce round-trips and respect typical payload limits.
+
+       Each batch is wrapped in asyncio.wait_for so a hanging API call never
+       blocks the server indefinitely.  Set DEBUG_SKIP_EMBEDDINGS=true in .env
+       to store zero-vectors and skip the API entirely (useful to isolate whether
+       slowness comes from extraction/chunking or from Mistral).
        """
        if not chunks:
            return
 
+       batch_size = settings.embed_batch_size
+       timeout    = settings.embed_timeout_seconds
+       # embed_mode is the primary flag; debug_skip_embeddings is the legacy fallback.
+       skip_api   = settings.embed_mode == "skip" or settings.debug_skip_embeddings
+
+       logger.info(
+           "[embed] mode=%s  chunks=%d  batch_size=%d  timeout=%ds",
+           "skip" if skip_api else "real", len(chunks), batch_size, timeout,
+       )
+
+       if skip_api:
+           logger.warning(
+               "[embed] SKIP mode — storing %d zero-vectors, Mistral API will NOT be called",
+               len(chunks),
+           )
+           placeholder = [0.0] * _MISTRAL_EMBED_DIM
+           for chunk in chunks:
+               self._vector_store[chunk.chunk_id] = {"chunk": chunk, "embedding": placeholder}
+               self._bm25_index[chunk.chunk_id]   = _tokenize(chunk.text)
+           logger.info("[embed] stored %d placeholder chunks — to use real embeddings set EMBED_MODE=real", len(chunks))
+           return
+
        client = Mistral(api_key=settings.mistral_api_key)
+       logger.info(
+           "[embed] REAL mode — starting Mistral API calls: %d chunks, batch_size=%d, timeout=%ds",
+           len(chunks), batch_size, timeout,
+       )
 
+       for i in range(0, len(chunks), batch_size):
+           batch = chunks[i : i + batch_size]
+           # Capture texts in default arg to avoid loop-closure pitfall
+           batch_texts = [c.text for c in batch]
 
-        # send batches of chunks to the embedding API
-       for i in range(0, len(chunks), _EMBED_BATCH_SIZE):
-           batch = chunks[i : i + _EMBED_BATCH_SIZE]
-           texts = [c.text for c in batch]
-
-           def _call_embed() -> object:
+           def _call_embed(texts=batch_texts) -> object:
                return client.embeddings.create(
                    model=settings.mistral_embed_model,
                    inputs=texts,
                )
 
-        # response.data = [
-        #     { index: 0, embedding: [embedding vector for batch 1] },
-        #     { index: 1, embedding: [embedding vector for batch 2] },
-        #     ...
-        # ]
+           batch_num = i // batch_size + 1
+           total_batches = (len(chunks) + batch_size - 1) // batch_size
+           logger.info(
+               "[embed] batch %d/%d — %d chunks (chars: %d)",
+               batch_num, total_batches, len(batch),
+               sum(len(t) for t in batch_texts),
+           )
 
+           t0 = time.monotonic()
            try:
-               response = await asyncio.to_thread(_call_embed)
+               response = await asyncio.wait_for(
+                   asyncio.to_thread(_call_embed),
+                   timeout=timeout,
+               )
+           except asyncio.TimeoutError:
+               logger.error(
+                   "[embed] batch %d/%d TIMED OUT after %ds — "
+                   "Mistral API did not respond. Check network/API key.",
+                   batch_num, total_batches, timeout,
+               )
+               raise RuntimeError(
+                   f"Embedding API timed out after {timeout}s on batch {batch_num}/{total_batches}. "
+                   "Check your network connection and Mistral API key."
+               )
            except Exception as exc:
-               logger.exception("Embedding API failed for batch starting %d: %s", i, exc)
+               logger.exception(
+                   "[embed] batch %d/%d FAILED after %.3fs: %s",
+                   batch_num, total_batches, time.monotonic() - t0, exc,
+               )
                raise
 
-           by_index: dict[int, list[float]] = {}
-           for row in response.data:
-               idx = row.index if row.index is not None else 0
-               if row.embedding:
-                   by_index[idx] = list(row.embedding)
+           elapsed = time.monotonic() - t0
+           logger.info(
+               "[embed] batch %d/%d OK — %.3fs — received %d embeddings",
+               batch_num, total_batches, elapsed, len(response.data),
+           )
 
-           for j, chunk in enumerate(batch):
-               embedding = by_index.get(j, [])
-               # semantic store: chunk_id -> {chunk, embedding}
-               self._vector_store[chunk.chunk_id] = {
-                   "chunk": chunk,
-                   "embedding": embedding,
-               }
-               # keyword store: chunk_id -> token list
-               self._bm25_index[chunk.chunk_id] = _tokenize(chunk.text)
+           # The API returns embeddings in the same order as inputs; zip directly
+           # instead of relying on row.index (which is Optional and may be None).
+           embeddings = [
+               list(row.embedding) if row.embedding else []
+               for row in response.data
+           ]
+           for chunk, embedding in zip(batch, embeddings):
+               self._vector_store[chunk.chunk_id] = {"chunk": chunk, "embedding": embedding}
+               self._bm25_index[chunk.chunk_id]   = _tokenize(chunk.text)
 
-       logger.debug("Stored %d chunks in vector/BM25 stores", len(chunks))
+       logger.info("[embed] done — stored %d chunks in vector/BM25 stores", len(chunks))

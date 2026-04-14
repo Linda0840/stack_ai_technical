@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG Agent — PDF Q&amp;A</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f5f6fa;
+      --card:      #ffffff;
+      --border:    #e2e5ef;
+      --primary:   #4f6ef7;
+      --primary-h: #3a57e8;
+      --danger:    #ef4444;
+      --success:   #22c55e;
+      --text:      #1e2235;
+      --muted:     #6b7280;
+      --radius:    14px;
+      --shadow:    0 4px 24px rgba(0,0,0,.07);
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, #4f6ef7 0%, #7c3aed 100%);
+      color: #fff;
+      padding: 22px 40px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      box-shadow: 0 2px 16px rgba(79,110,247,.25);
+    }
+    header svg { flex-shrink: 0; }
+    header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.3px; }
+    header p  { font-size: .85rem; opacity: .85; margin-top: 2px; }
+
+    /* ── Layout ── */
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+      max-width: 1100px;
+      width: 100%;
+      margin: 36px auto;
+      padding: 0 24px 40px;
+    }
+    @media (max-width: 760px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .card-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--text);
+    }
+    .card-title .icon {
+      width: 36px; height: 36px;
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .icon-blue  { background: #eef1fe; color: var(--primary); }
+    .icon-purple{ background: #f3effe; color: #7c3aed; }
+
+    /* ── Instructions ── */
+    .instructions {
+      background: #f8f9ff;
+      border: 1px solid #dce2fd;
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .instructions h3 {
+      font-size: .78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--primary);
+      margin-bottom: 2px;
+    }
+    .rule {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: .85rem;
+      color: #374151;
+      line-height: 1.45;
+    }
+    .rule-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--primary);
+      flex-shrink: 0;
+      margin-top: 6px;
+    }
+
+    /* ── Drop Zone ── */
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 32px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      position: relative;
+    }
+    .drop-zone:hover,
+    .drop-zone.drag-over { border-color: var(--primary); background: #f0f3ff; }
+    .drop-zone input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .drop-zone svg { color: var(--primary); margin-bottom: 8px; }
+    .drop-zone p   { font-size: .88rem; color: var(--muted); line-height: 1.5; }
+    .drop-zone strong { color: var(--primary); font-weight: 600; }
+
+    /* ── File List ── */
+    #file-list { display: flex; flex-direction: column; gap: 8px; }
+    .file-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #f8f9ff;
+      border: 1px solid #dce2fd;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: .84rem;
+    }
+    .file-item .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-item .file-size { color: var(--muted); white-space: nowrap; }
+    .file-item .remove-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--muted); font-size: 1rem; line-height: 1;
+      padding: 0 2px; transition: color .15s;
+    }
+    .file-item .remove-btn:hover { color: var(--danger); }
+    .file-error { font-size: .82rem; color: var(--danger); display: flex; align-items: center; gap: 5px; }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      gap: 7px;
+      padding: 10px 22px;
+      border-radius: 9px;
+      border: none;
+      font-size: .9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .15s, opacity .15s, transform .1s;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-h); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+    .btn-full { width: 100%; }
+
+    /* ── Query textarea ── */
+    .query-wrap { position: relative; }
+    textarea {
+      width: 100%;
+      min-height: 130px;
+      resize: vertical;
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      font-family: inherit;
+      font-size: .92rem;
+      color: var(--text);
+      background: #fafafa;
+      transition: border-color .2s, box-shadow .2s;
+      outline: none;
+      line-height: 1.55;
+    }
+    textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,110,247,.12); background: #fff; }
+    .char-count { font-size: .76rem; color: var(--muted); text-align: right; margin-top: 4px; }
+    .char-count.warn { color: var(--danger); }
+
+    /* ── Advanced Settings disclosure ── */
+    .advanced-toggle {
+      display: flex; align-items: center; gap: 6px;
+      background: none; border: none; cursor: pointer;
+      font-size: .82rem; font-weight: 600;
+      color: var(--muted);
+      padding: 0;
+      user-select: none;
+      width: fit-content;
+      transition: color .15s;
+    }
+    .advanced-toggle:hover { color: var(--primary); }
+    .advanced-toggle .chevron {
+      transition: transform .22s ease;
+      flex-shrink: 0;
+    }
+    .advanced-toggle[aria-expanded="true"] .chevron {
+      transform: rotate(90deg);
+    }
+    .advanced-body {
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      background: #f8f9ff;
+      border: 1px solid #dce2fd;
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .advanced-body.open { display: flex; }
+    .advanced-section-title {
+      font-size: .82rem; font-weight: 700; color: var(--text);
+    }
+    .advanced-hint {
+      font-size: .78rem; color: var(--muted); line-height: 1.5; margin-top: -4px;
+    }
+    /* ── Top-K ── */
+    .topk-row { display: flex; align-items: center; gap: 12px; }
+    .topk-row label { font-size: .84rem; color: var(--muted); white-space: nowrap; }
+    .topk-row input[type="range"] { flex: 1; accent-color: var(--primary); }
+    .topk-val {
+      width: 30px; text-align: center;
+      font-size: .84rem; font-weight: 700; color: var(--primary);
+    }
+
+    /* ── Result panel ── */
+    .result-box {
+      border-radius: 10px;
+      padding: 16px;
+      font-size: .88rem;
+      line-height: 1.65;
+      display: none;
+    }
+    .result-box.visible { display: block; }
+    .result-box.success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; }
+    .result-box.error   { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+    .result-box.info    { background: #f0f3ff; border: 1px solid #c7d2fe; color: #3730a3; }
+
+    /* ── Answer display ── */
+    #answer-panel { display: none; flex-direction: column; gap: 14px; }
+    #answer-panel.visible { display: flex; }
+    .answer-box {
+      background: #f8f9ff;
+      border: 1px solid #dce2fd;
+      border-radius: 10px;
+      padding: 16px;
+      font-size: .9rem;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      color: var(--text);
+    }
+    .sources-title {
+      font-size: .78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+    }
+    .source-chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      background: #eef1fe; color: var(--primary);
+      border-radius: 6px; padding: 3px 9px;
+      font-size: .78rem; font-weight: 600; margin: 3px 3px 0 0;
+    }
+
+    /* ── Spinner ── */
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Session status bar ── */
+    .session-status {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 13px;
+      border-radius: 9px;
+      font-size: .82rem; font-weight: 500;
+      transition: background .2s, color .2s;
+    }
+    .session-status.loading  { background: #f3f4f6; color: var(--muted);  border: 1px solid var(--border); }
+    .session-status.empty    { background: #f8f9ff; color: var(--muted);  border: 1px solid #dce2fd; }
+    .session-status.has-files{ background: #f0fdf4; color: #166534;       border: 1px solid #bbf7d0; }
+
+    /* ── Danger button (clear session) ── */
+    .btn-ghost-danger {
+      background: #fff0f0; color: var(--danger);
+      border: 1.5px solid #fecaca;
+    }
+    .btn-ghost-danger:hover    { background: #fee2e2; }
+    .btn-ghost-danger:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
+    /* ── Clear section ── */
+    .clear-section { display: flex; flex-direction: column; gap: 8px; }
+    .clear-hint {
+      font-size: .78rem; color: var(--muted); line-height: 1.5; text-align: center;
+    }
+
+    /* ── Divider ── */
+    .divider { border: none; border-top: 1px solid var(--border); }
+
+    footer {
+      text-align: center;
+      font-size: .78rem;
+      color: var(--muted);
+      padding: 16px;
+      border-top: 1px solid var(--border);
+      margin-top: auto;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <svg width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true">
+    <rect width="36" height="36" rx="9" fill="rgba(255,255,255,.2)"/>
+    <path d="M10 26V12a2 2 0 012-2h8l6 6v10a2 2 0 01-2 2H12a2 2 0 01-2-2z" stroke="#fff" stroke-width="1.8" fill="none"/>
+    <path d="M20 10v6h6" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+    <path d="M14 20h8M14 23h5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/>
+  </svg>
+  <div>
+    <h1>RAG Agent — PDF Q&amp;A</h1>
+    <p>Upload your PDFs, then ask anything about them.</p>
+  </div>
+</header>
+
+<main>
+
+  <!-- ══ LEFT: UPLOAD ══ -->
+  <div class="card">
+    <div class="card-title">
+      <span class="icon icon-blue">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </span>
+      Upload PDF Files
+    </div>
+
+    <div class="session-status loading" id="session-status" aria-live="polite">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
+      </svg>
+      <span id="session-status-text">Loading session…</span>
+    </div>
+
+    <div class="instructions">
+      <h3>Instructions</h3>
+      <div class="rule"><span class="rule-dot"></span>Please upload at least one PDF file. Other formats are not supported.</div>
+      <div class="rule"><span class="rule-dot"></span>Note that each file must be 20 MB or less.</div>
+    </div>
+
+    <div class="drop-zone" id="drop-zone">
+      <input type="file" id="file-input" accept=".pdf,application/pdf" multiple />
+      <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="12" y1="18" x2="12" y2="12"/>
+        <line x1="9" y1="15" x2="15" y2="15"/>
+      </svg>
+      <p><strong>Click to browse</strong> or drag &amp; drop your PDFs here.</p>
+    </div>
+
+    <div id="file-list"></div>
+    <div id="upload-error" class="file-error" style="display:none">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span id="upload-error-msg"></span>
+    </div>
+
+    <button class="btn btn-primary btn-full" id="upload-btn" disabled>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      Upload &amp; Ingest
+    </button>
+
+    <div id="upload-result" class="result-box"></div>
+
+    <hr class="divider" />
+    <div class="clear-section">
+      <button class="btn btn-ghost-danger btn-full" id="clear-btn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+        </svg>
+        Clear Session
+      </button>
+      <p class="clear-hint">Clearing the session removes all files from the current knowledge database. Uploaded content cannot be recovered after clearing.</p>
+      <div id="clear-result" class="result-box"></div>
+    </div>
+  </div>
+
+  <!-- ══ RIGHT: QUERY ══ -->
+  <div class="card">
+    <div class="card-title">
+      <span class="icon icon-purple">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+        </svg>
+      </span>
+      Ask a Question
+    </div>
+
+    <div class="instructions">
+      <h3>How it works</h3>
+      <div class="rule"><span class="rule-dot" style="background:#7c3aed"></span>Upload your PDFs first, then type any question about their content.</div>
+      <div class="rule"><span class="rule-dot" style="background:#7c3aed"></span>The AI will search and synthesize an answer from your files.</div>
+    </div>
+
+    <div>
+      <div class="query-wrap">
+        <textarea
+          id="query-input"
+          maxlength="2000"
+          placeholder="Please input your query here — e.g. 'What are the main findings in section 3?'"
+        ></textarea>
+      </div>
+      <div class="char-count"><span id="char-count">0</span> / 2000</div>
+    </div>
+
+    <button class="advanced-toggle" id="advanced-toggle" aria-expanded="false" aria-controls="advanced-body">
+      <svg class="chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 18 15 12 9 6"/>
+      </svg>
+      Advanced Settings
+    </button>
+    <div class="advanced-body" id="advanced-body" role="region">
+      <div class="advanced-section-title">Answer Depth</div>
+      <p class="advanced-hint">This is the number of sources to use. Note that more sources mean deeper but slower answers. Default is 5 sources.</p>
+      <div class="topk-row">
+        <label for="topk-slider">Sources:</label>
+        <input type="range" id="topk-slider" min="1" max="20" value="5" />
+        <span class="topk-val" id="topk-display">5</span>
+      </div>
+    </div>
+
+    <button class="btn btn-primary btn-full" id="query-btn" disabled>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+      Send Query
+    </button>
+
+    <div id="query-error" class="result-box error" style="display:none"></div>
+
+    <div id="answer-panel">
+      <hr class="divider" />
+      <div class="answer-box" id="answer-text"></div>
+      <div>
+        <div class="sources-title" style="margin-bottom:6px">Sources</div>
+        <div id="sources-list"></div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<footer>RAG Agent API v0.1.0 &mdash; Powered by Mistral AI</footer>
+
+<script>
+  const MAX_FILE_SIZE_MB = 20;
+  const MAX_FILE_SIZE_B  = MAX_FILE_SIZE_MB * 1024 * 1024;
+  const API_BASE = '';   // same origin; change if running separately
+
+  // ── state
+  let selectedFiles    = [];
+  let currentFileCount = 0;   // kept in sync with /health after every upload & clear
+
+  // ── refs
+  const dropZone       = document.getElementById('drop-zone');
+  const fileInput      = document.getElementById('file-input');
+  const fileList       = document.getElementById('file-list');
+  const uploadError    = document.getElementById('upload-error');
+  const uploadErrMsg   = document.getElementById('upload-error-msg');
+  const uploadBtn      = document.getElementById('upload-btn');
+  const uploadResult   = document.getElementById('upload-result');
+  const sessionStatus  = document.getElementById('session-status');
+  const sessionStatusT = document.getElementById('session-status-text');
+  const clearBtn       = document.getElementById('clear-btn');
+  const clearResult    = document.getElementById('clear-result');
+
+  const queryInput  = document.getElementById('query-input');
+  const charCount   = document.getElementById('char-count');
+  const topkSlider  = document.getElementById('topk-slider');
+  const topkDisplay = document.getElementById('topk-display');
+  const queryBtn    = document.getElementById('query-btn');
+  const queryError  = document.getElementById('query-error');
+  const answerPanel = document.getElementById('answer-panel');
+  const answerText  = document.getElementById('answer-text');
+  const sourcesList = document.getElementById('sources-list');
+
+  // ══════════════════════════════════════
+  //  SESSION STATUS
+  // ══════════════════════════════════════
+
+  async function loadSessionStatus() {
+    try {
+      const res  = await fetch(`${API_BASE}/health`);
+      if (!res.ok) return;
+      const data = await res.json();
+      currentFileCount = data.documents_indexed || 0;
+    } catch (_) {
+      return;
+    }
+    const n = currentFileCount;
+    if (n === 0) {
+      sessionStatus.className    = 'session-status empty';
+      sessionStatusT.textContent = 'No files in this session — upload a PDF to get started.';
+    } else {
+      sessionStatus.className    = 'session-status has-files';
+      sessionStatusT.textContent = `${n} file${n === 1 ? '' : 's'} in the current session`;
+    }
+  }
+
+  // ══════════════════════════════════════
+  //  FILE UPLOAD SECTION
+  // ══════════════════════════════════════
+
+  function validateAndAddFiles(rawFiles) {
+    clearUploadError();
+    const errors = [];
+
+    Array.from(rawFiles).forEach(file => {
+      if (file.type !== 'application/pdf') {
+        errors.push(`"${file.name}" is not a PDF file.`);
+        return;
+      }
+      if (file.size > MAX_FILE_SIZE_B) {
+        errors.push(`"${file.name}" exceeds the ${MAX_FILE_SIZE_MB} MB size limit.`);
+        return;
+      }
+      // Avoid duplicates by name
+      if (!selectedFiles.find(f => f.name === file.name && f.size === file.size)) {
+        selectedFiles.push(file);
+      }
+    });
+
+    if (errors.length) showUploadError(errors.join(' '));
+    renderFileList();
+    syncUploadBtn();
+  }
+
+  function renderFileList() {
+    fileList.innerHTML = '';
+    selectedFiles.forEach((file, idx) => {
+      const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
+      const item = document.createElement('div');
+      item.className = 'file-item';
+      item.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#4f6ef7" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span class="file-name" title="${file.name}">${file.name}</span>
+        <span class="file-size">${sizeMB} MB</span>
+        <button class="remove-btn" title="Remove" data-idx="${idx}">&times;</button>`;
+      fileList.appendChild(item);
+    });
+
+    fileList.querySelectorAll('.remove-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        selectedFiles.splice(+btn.dataset.idx, 1);
+        renderFileList();
+        syncUploadBtn();
+      });
+    });
+  }
+
+  function syncUploadBtn() {
+    uploadBtn.disabled = selectedFiles.length === 0;
+  }
+
+  function showUploadError(msg) {
+    uploadErrMsg.textContent = msg;
+    uploadError.style.display = 'flex';
+  }
+  function clearUploadError() {
+    uploadError.style.display = 'none';
+    uploadErrMsg.textContent  = '';
+  }
+
+  // Drag & drop
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    validateAndAddFiles(e.dataTransfer.files);
+  });
+  fileInput.addEventListener('change', () => {
+    validateAndAddFiles(fileInput.files);
+    fileInput.value = '';  // reset so the same file can be re-added after removal
+  });
+
+  // Upload button
+  uploadBtn.addEventListener('click', async () => {
+    if (!selectedFiles.length) return;
+    clearUploadError();
+    uploadResult.className = 'result-box';
+    uploadResult.style.display = 'none';
+
+    // Show spinner
+    uploadBtn.disabled = true;
+    uploadBtn.innerHTML = '<div class="spinner"></div> Uploading…';
+
+    try {
+      const form = new FormData();
+      selectedFiles.forEach(f => form.append('files', f));
+
+      const res = await fetch(`${API_BASE}/api/v1/ingest`, { method: 'POST', body: form });
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.detail || `Server error ${res.status}`);
+      }
+
+      await loadSessionStatus();
+      const n = currentFileCount;
+      const names = data.filenames.join(', ');
+      uploadResult.className = 'result-box success visible';
+      uploadResult.innerHTML = `
+        <strong>✓ Upload successful!</strong><br>
+        You have successfully uploaded <strong>${names}</strong>.<br>
+        There are now <strong>${n}</strong> file${n === 1 ? '' : 's'} in the current work session.
+      `;
+      selectedFiles = [];
+      renderFileList();
+    } catch (err) {
+      uploadResult.className = 'result-box error visible';
+      uploadResult.innerHTML = `<strong>✗ Upload failed:</strong> ${err.message}`;
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.innerHTML = `
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Upload &amp; Ingest`;
+      syncUploadBtn();
+    }
+  });
+
+  // ══════════════════════════════════════
+  //  QUERY SECTION
+  // ══════════════════════════════════════
+
+  queryInput.addEventListener('input', () => {
+    const len = queryInput.value.length;
+    charCount.textContent = len;
+    charCount.parentElement.className = 'char-count' + (len > 1900 ? ' warn' : '');
+    queryBtn.disabled = len === 0;
+  });
+
+  topkSlider.addEventListener('input', () => {
+    topkDisplay.textContent = topkSlider.value;
+  });
+
+  // ══════════════════════════════════════
+  //  CLEAR SESSION
+  // ══════════════════════════════════════
+
+  clearBtn.addEventListener('click', async () => {
+    clearResult.className = 'result-box';
+    clearResult.style.display = 'none';
+    clearBtn.disabled = true;
+    clearBtn.innerHTML = '<div class="spinner" style="border-color:rgba(239,68,68,.3);border-top-color:#ef4444"></div> Clearing…';
+
+    try {
+      const res  = await fetch(`${API_BASE}/api/v1/ingest`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `Error ${res.status}`);
+
+      await loadSessionStatus();
+      clearResult.className = 'result-box success visible';
+      clearResult.innerHTML = `<strong>✓ Session cleared.</strong> All files have been removed from the knowledge database.`;
+    } catch (err) {
+      clearResult.className = 'result-box error visible';
+      clearResult.innerHTML = `<strong>✗ Clear failed:</strong> ${err.message}`;
+    } finally {
+      clearBtn.disabled = false;
+      clearBtn.innerHTML = `
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+        </svg>
+        Clear Session`;
+    }
+  });
+
+  // Advanced Settings toggle
+  const advancedToggle = document.getElementById('advanced-toggle');
+  const advancedBody   = document.getElementById('advanced-body');
+  advancedToggle.addEventListener('click', () => {
+    const isOpen = advancedBody.classList.toggle('open');
+    advancedToggle.setAttribute('aria-expanded', isOpen);
+  });
+
+  queryBtn.addEventListener('click', async () => {
+    const q = queryInput.value.trim();
+    if (!q) return;
+
+    queryError.style.display  = 'none';
+    answerPanel.className     = '';
+    queryBtn.disabled         = true;
+    queryBtn.innerHTML        = '<div class="spinner"></div> Thinking…';
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/query`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ query: q, top_k: +topkSlider.value }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+
+      answerText.textContent = data.answer || '(No answer returned.)';
+
+      sourcesList.innerHTML = '';
+      if (data.sources && data.sources.length) {
+        const seen = new Set();
+        data.sources.forEach(s => {
+          const label = `${s.filename} — p.${s.page_number}`;
+          if (!seen.has(label)) {
+            seen.add(label);
+            const chip = document.createElement('span');
+            chip.className = 'source-chip';
+            chip.innerHTML = `
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/></svg>
+              ${label}`;
+            sourcesList.appendChild(chip);
+          }
+        });
+      } else {
+        sourcesList.innerHTML = '<span style="font-size:.82rem;color:var(--muted)">No sources returned.</span>';
+      }
+
+      answerPanel.className = 'visible';
+    } catch (err) {
+      queryError.textContent  = `✗ Query failed: ${err.message}`;
+      queryError.style.display = 'block';
+    } finally {
+      queryBtn.disabled  = false;
+      queryBtn.innerHTML = `
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        Send Query`;
+    }
+  });
+
+  // ── initialise session status on page load
+  loadSessionStatus();
+</script>
+</body>
+</html>

@@ -15,16 +15,16 @@
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 
+from app.core.config import get_settings
 from app.models.schemas import IngestResponse # response is typed with IngestResponse
 from app.services.ingestion import IngestionService # injection logic
-from app.api.deps import get_ingestion_service  # FastAPI injects the service through get_ingestion_service
+from app.api.deps import get_ingestion_service, get_vector_store, get_bm25_index
 
 
 router = APIRouter(prefix="/ingest", tags=["Ingestion"])
-
+_settings = get_settings()
 
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
-MAX_FILE_SIZE_MB = 20
 
 
 
@@ -49,6 +49,15 @@ async def ingest_documents(
            detail="At least one file must be provided.",
        )
 
+   # Guard: reject oversized batches before reading any bytes.
+   if len(files) > _settings.max_files_per_request:
+       raise HTTPException(
+           status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+           detail=(
+               f"At most {_settings.max_files_per_request} files may be submitted "
+               "per request. Please split your upload into smaller batches."
+           ),
+       )
 
    for f in files:
        if f.content_type not in ALLOWED_CONTENT_TYPES:
@@ -57,9 +66,24 @@ async def ingest_documents(
                detail=f"'{f.filename}' is not a PDF (got content-type: {f.content_type}).",
            )
 
+   try:
+       document_ids, total_chunks = await service.ingest_files(files)
+   except ValueError as exc:
+       # Raised by the service when an individual file exceeds the size limit.
+       raise HTTPException(
+           status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+           detail=str(exc),
+       ) from exc
 
-   document_ids, total_chunks = await service.ingest_files(files)
-
+   if total_chunks == 0:
+       raise HTTPException(
+           status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+           detail=(
+               "No text could be extracted from the uploaded file(s). "
+               "This usually means the PDF is a scanned image without a text layer. "
+               "Please use a text-based PDF and try again."
+           ),
+       )
 
    return IngestResponse(
        document_ids=document_ids,
@@ -67,3 +91,23 @@ async def ingest_documents(
        filenames=[f.filename for f in files],
        message=f"Successfully ingested {len(files)} file(s) into {total_chunks} chunk(s).",
    )
+
+
+@router.delete(
+   "",
+   status_code=status.HTTP_200_OK,
+   summary="Clear all indexed documents from the knowledge base",
+)
+async def clear_documents(
+   vector_store: dict = Depends(get_vector_store),
+   bm25_index: dict  = Depends(get_bm25_index),
+) -> dict:
+   """Remove every indexed chunk from the in-memory vector store and BM25 index."""
+   doc_ids = {v["chunk"].document_id for v in vector_store.values() if "chunk" in v}
+   removed = len(doc_ids)
+   vector_store.clear()
+   bm25_index.clear()
+   return {
+       "message": f"Knowledge base cleared. {removed} document(s) removed.",
+       "documents_removed": removed,
+   }

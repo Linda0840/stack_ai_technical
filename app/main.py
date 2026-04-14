@@ -7,6 +7,9 @@ import logging
 
 from fastapi import FastAPI # backend app
 from fastapi.middleware.cors import CORSMiddleware     # allows frontend (like UI) to call API
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+import os
 
 from app.core.config import get_settings    # loads config (env variables, etc.)
 from app.api.routes import ingestion, query, health # API route modules
@@ -56,3 +59,11 @@ app.add_middleware(
 app.include_router(health.router) # health check endpoint
 app.include_router(ingestion.router, prefix="/api/v1") # ingestion endpoint
 app.include_router(query.router, prefix="/api/v1") # query endpoint
+
+# serve the frontend
+_static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+@app.get("/", include_in_schema=False)
+async def serve_ui():
+    return FileResponse(os.path.join(_static_dir, "index.html"))

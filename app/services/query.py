@@ -11,6 +11,8 @@ import math
 import re
 from typing import Any
 
+import numpy as np
+
 from mistralai.client import Mistral
 from mistralai.client.models.assistantmessage import AssistantMessage
 from mistralai.client.models.systemmessage import SystemMessage
@@ -270,14 +272,27 @@ class QueryService:
 
        Hybrid score = semantic_weight * semantic_score
                     + keyword_weight  * bm25_score
+
+       Scalability notes
+       -----------------
+       - Cosine similarity is computed via a single numpy matrix-vector multiply
+         (one BLAS call) instead of n pure-Python loops, giving ~100× speedup for
+         large indexes.
+       - retrieve_k is hard-capped at settings.max_retrieve_k so the downstream
+         reranker prompt never exceeds the LLM context window regardless of top_k.
+       - A production system with millions of chunks would replace this linear scan
+         with an ANN index (e.g. FAISS / ScaNN), but for thousands of chunks this
+         numpy approach is fast enough without an extra dependency.
        """
        logger.debug("_hybrid_search: query=%r top_k=%d store_size=%d", query, top_k, len(self._vector_store))
        if not self._vector_store:
            return []
 
-
-        # min of len(self._vector_score) ensures not to retrieve more chunks than available
-       retrieve_k = min(len(self._vector_store), max(top_k * 4, max(15, top_k)))
+       # Hard cap: never return more candidates than max_retrieve_k, regardless of top_k.
+       retrieve_k = min(
+           len(self._vector_store),
+           min(settings.max_retrieve_k, max(top_k * 4, 15)),
+       )
 
        query_tokens = _tokenize(query)
        bm25_raw = _bm25_scores_for_query(query_tokens, self._bm25_index)
@@ -298,32 +313,58 @@ class QueryService:
            logger.warning("Query embedding failed, keyword-only hybrid: %s", exc)
            q_emb = []
 
-       hybrid: list[tuple[str, float, RetrievedChunk]] = []
-       for chunk_id, entry in self._vector_store.items():
-           chunk = entry["chunk"]
-           emb = entry.get("embedding") or []
+       # Snapshot the store keys once so iteration order is consistent.
+       chunk_ids = list(self._vector_store.keys())
+       entries = [self._vector_store[cid] for cid in chunk_ids]
+       n = len(chunk_ids)
 
-           # compare query embedding with every vector embedding
-           sem = _cosine_dense(q_emb, emb) if q_emb else 0.0
-           kw = bm25_norm.get(chunk_id, 0.0)
-           score = settings.semantic_weight * sem + settings.keyword_weight * kw
-           hybrid.append(
-               (
-                   chunk_id,
-                   score,
-                   RetrievedChunk(
-                       chunk_id=chunk.chunk_id,
-                       document_id=chunk.document_id,
-                       filename=chunk.filename,
-                       text=chunk.text,
-                       page_number=chunk.page_number,
-                       score=score,
-                   ),
+       # ── Vectorised semantic scores ────────────────────────────────────────
+       # Build a (n × dim) float32 matrix then do one matrix-vector multiply.
+       # This replaces n individual _cosine_dense() Python calls.
+       sem_scores = np.zeros(n, dtype=np.float32)
+       if q_emb:
+           q_vec = np.array(q_emb, dtype=np.float32)
+           q_norm = float(np.linalg.norm(q_vec))
+           if q_norm > 0:
+               dim = len(q_emb)
+               emb_matrix = np.zeros((n, dim), dtype=np.float32)
+               for i, entry in enumerate(entries):
+                   emb = entry.get("embedding") or []
+                   if len(emb) == dim:
+                       emb_matrix[i] = emb
+               row_norms = np.linalg.norm(emb_matrix, axis=1)
+               valid = row_norms > 0
+               if valid.any():
+                   sem_scores[valid] = (emb_matrix[valid] @ q_vec) / (row_norms[valid] * q_norm)
+
+       # ── BM25 scores ───────────────────────────────────────────────────────
+       bm25_arr = np.array([bm25_norm.get(cid, 0.0) for cid in chunk_ids], dtype=np.float32)
+
+       # ── Hybrid fusion ─────────────────────────────────────────────────────
+       hybrid_scores = settings.semantic_weight * sem_scores + settings.keyword_weight * bm25_arr
+
+       # argpartition is O(n) vs O(n log n) for a full sort — only pay log-k cost.
+       if retrieve_k >= n:
+           top_idx = np.argsort(hybrid_scores)[::-1]
+       else:
+           part = np.argpartition(hybrid_scores, -retrieve_k)[-retrieve_k:]
+           top_idx = part[np.argsort(hybrid_scores[part])[::-1]]
+
+       results: list[RetrievedChunk] = []
+       for i in top_idx:
+           chunk = entries[i]["chunk"]
+           score = float(hybrid_scores[i])
+           results.append(
+               RetrievedChunk(
+                   chunk_id=chunk.chunk_id,
+                   document_id=chunk.document_id,
+                   filename=chunk.filename,
+                   text=chunk.text,
+                   page_number=chunk.page_number,
+                   score=score,
                )
            )
-
-       hybrid.sort(key=lambda x: x[1], reverse=True)
-       return [h[2] for h in hybrid[:retrieve_k]]
+       return results
 
 
    async def _rerank(
@@ -337,6 +378,11 @@ class QueryService:
        if len(chunks) == 1:
            return chunks[:top_k]
 
+       # Hard cap: clamp the candidate list before building the LLM prompt so we
+       # never exceed the model's context window regardless of retrieve_k.
+       # With max_body=450 chars/chunk and max_rerank_chunks=25 the block is at
+       # most ~11 250 chars (~2 800 tokens) — well within Mistral Small's limit.
+       candidates = chunks[: settings.max_rerank_chunks]
 
         # for each chunk, it removes newlines, truncates to 450 characters,
         # labels with [0], [1], ...
@@ -351,7 +397,7 @@ class QueryService:
 
        max_body = 450
        lines: list[str] = []
-       for i, c in enumerate(chunks):
+       for i, c in enumerate(candidates):
            snippet = c.text.replace("\n", " ")[:max_body]
            lines.append(f"[{i}] (file={c.filename}, page={c.page_number})\n{snippet}")
 
@@ -396,12 +442,12 @@ class QueryService:
        except (json.JSONDecodeError, ValueError, TypeError) as exc:
            logger.debug("Could not parse rerank JSON: %s raw=%r", exc, raw[:200])
 
-        # check if the model returns one score per chunk
-       if len(scores) != len(chunks):
+       # The LLM scores exactly the candidates slice, not the full chunks list.
+       if len(scores) != len(candidates):
            return chunks[:top_k]
 
        ordered = sorted(
-           zip(chunks, scores),
+           zip(candidates, scores),
            key=lambda x: x[1],
            reverse=True,
        )
@@ -418,8 +464,10 @@ class QueryService:
        if not chunks:
            return "I could not find relevant information in the indexed documents."
 
+       # Truncate each chunk's text so a high top_k cannot produce an unbounded prompt.
+       max_ctx_chars = 800
        context = "\n\n".join(
-           f"[Source: {c.filename}, p.{c.page_number}]\n{c.text}" for c in chunks
+           f"[Source: {c.filename}, p.{c.page_number}]\n{c.text[:max_ctx_chars]}" for c in chunks
        )
        system = (
            "You are a careful assistant. Answer using only the provided context. "
