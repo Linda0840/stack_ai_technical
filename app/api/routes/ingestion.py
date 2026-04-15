@@ -17,13 +17,14 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from app.core.config import get_settings
-from app.models.schemas import DocumentInfo, DocumentListResponse, IngestResponse
+from app.models.schemas import DocumentInfo, DocumentListResponse, IngestResponse, WorkspaceUsage
 from app.services.ingestion import IngestionService
 from app.api.deps import (
     get_document_registry,
     get_ingestion_service,
     get_vector_store,
     get_bm25_index,
+    get_workspace_stats,
 )
 
 
@@ -44,6 +45,7 @@ ALLOWED_CONTENT_TYPES = {"application/pdf"}
 async def list_documents(
    registry: list = Depends(get_document_registry),
    vector_store: dict = Depends(get_vector_store),
+   workspace_stats: dict = Depends(get_workspace_stats),
 ) -> DocumentListResponse:
    """
    Returns every file that has been uploaded and indexed since the server
@@ -67,10 +69,20 @@ async def list_documents(
        )
        for rec in registry
    ]
+   cap = _settings.max_workspace_chunks
+   used = workspace_stats["total_chunks"]
+   usage = WorkspaceUsage(
+       total_chunks=used,
+       total_chars=workspace_stats["total_chars"],
+       max_chunks=cap,
+       percent_used=round(used / cap * 100, 1),
+   )
    return DocumentListResponse(
        documents=documents,
        total_documents=len(documents),
        total_chunks=sum(d.chunk_count for d in documents),
+       workspace_usage=usage,
+       max_file_size_mb=_settings.max_file_size_mb,
    )
 
 
@@ -84,6 +96,7 @@ async def ingest_documents(
    files: list[UploadFile] = File(..., description="One or more PDF files to ingest"),
    service: IngestionService = Depends(get_ingestion_service),
    registry: list = Depends(get_document_registry),
+   workspace_stats: dict = Depends(get_workspace_stats),
 ) -> IngestResponse:
    """
    Accepts one or more PDF files, extracts and chunks their text, generates
@@ -115,10 +128,16 @@ async def ingest_documents(
    try:
        document_ids, total_chunks = await service.ingest_files(files)
    except ValueError as exc:
-       # Raised by the service when an individual file exceeds the size limit.
+       msg = str(exc)
+       # Capacity exceeded → 400; oversized file → 413.
+       if "capacity exceeded" in msg.lower():
+           raise HTTPException(
+               status_code=status.HTTP_400_BAD_REQUEST,
+               detail=msg,
+           ) from exc
        raise HTTPException(
            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-           detail=str(exc),
+           detail=msg,
        ) from exc
 
    if total_chunks == 0:
@@ -141,11 +160,23 @@ async def ingest_documents(
            "uploaded_at": uploaded_at,
        })
 
+   cap = _settings.max_workspace_chunks
+   used = workspace_stats["total_chunks"]
+   usage = WorkspaceUsage(
+       total_chunks=used,
+       total_chars=workspace_stats["total_chars"],
+       max_chunks=cap,
+       percent_used=round(used / cap * 100, 1),
+   )
    return IngestResponse(
        document_ids=document_ids,
        total_chunks=total_chunks,
        filenames=[f.filename for f in files],
-       message=f"Successfully ingested {len(files)} file(s) into {total_chunks} chunk(s).",
+       message=(
+           f"Successfully ingested {len(files)} file(s) into {total_chunks} chunk(s). "
+           f"Workspace usage: {used}/{cap} chunks ({usage.percent_used}%)."
+       ),
+       workspace_usage=usage,
    )
 
 
@@ -158,6 +189,7 @@ async def clear_documents(
    vector_store: dict = Depends(get_vector_store),
    bm25_index: dict  = Depends(get_bm25_index),
    registry: list    = Depends(get_document_registry),
+   workspace_stats: dict = Depends(get_workspace_stats),
 ) -> dict:
    """Remove every indexed chunk from the in-memory vector store, BM25 index,
    and session document registry."""
@@ -165,6 +197,8 @@ async def clear_documents(
    vector_store.clear()
    bm25_index.clear()
    registry.clear()
+   workspace_stats["total_chunks"] = 0
+   workspace_stats["total_chars"] = 0
    return {
        "message": f"Knowledge base cleared. {removed} document(s) removed.",
        "documents_removed": removed,

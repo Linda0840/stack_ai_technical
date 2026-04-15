@@ -37,6 +37,9 @@ async def lifespan(app: FastAPI):
     # accumulates across multiple upload batches in the same session
     app.state.document_registry: list = []
 
+    # running totals used for capacity reporting ("65% of workspace used")
+    app.state.workspace_stats: dict = {"total_chunks": 0, "total_chars": 0}
+
     logger.info("In-memory stores initialised.")
     yield
     logger.info("Shutting down.")

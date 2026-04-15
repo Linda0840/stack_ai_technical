@@ -43,7 +43,11 @@ class Settings(BaseSettings):
     # Hard cap on files accepted per /ingest request; guards against memory exhaustion.
     max_files_per_request: int = 20
     # Maximum PDF size accepted (bytes = mb * 1024^2); enforced after reading bytes.
-    max_file_size_mb: int = 20
+    max_file_size_mb: int = 50
+    # Maximum total chunks allowed across the entire session workspace.
+    # Prevents unbounded memory growth; ~5 000 chunks ≈ several hundred pages of text.
+    # Users see a friendly capacity percentage before hitting this ceiling.
+    max_workspace_chunks: int = 5000
     # Maximum candidates returned by hybrid search before re-ranking.
     # Keeps the reranker LLM prompt from exceeding the context window.
     max_retrieve_k: int = 50
@@ -57,6 +61,14 @@ class Settings(BaseSettings):
     # answer and returns "insufficient evidence" instead.
     # Set to 0.0 via env (MIN_SIMILARITY_THRESHOLD=0) to disable the guard.
     min_similarity_threshold: float = 0.25
+
+    # ── Hallucination filter ──────────────────────────────────────────────────
+    # When True, a post-hoc evidence check verifies each factual claim in the
+    # generated answer against the retrieved chunks and removes unsupported ones.
+    # Disable via EVIDENCE_CHECK_ENABLED=false if latency is a concern.
+    evidence_check_enabled: bool = True
+    # Maximum number of claims to verify per answer (avoids token overflow).
+    evidence_check_max_claims: int = 20
 
     class Config:
         env_file = ".env"

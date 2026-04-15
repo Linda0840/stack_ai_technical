@@ -22,6 +22,5 @@ env/
 .vscode/
 .idea/
 
-# Data (optional but recommended for your project)
+# Data
 data/
-uploads/

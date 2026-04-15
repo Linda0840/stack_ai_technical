@@ -3,6 +3,15 @@ from typing import Optional
 from datetime import datetime
 
 
+# --- Workspace capacity ---
+
+class WorkspaceUsage(BaseModel):
+    total_chunks: int
+    total_chars: int
+    max_chunks: int
+    percent_used: float  # 0.0 – 100.0
+
+
 # --- Ingestion ---
 
 class DocumentChunk(BaseModel):
@@ -25,6 +34,8 @@ class DocumentListResponse(BaseModel):
     documents: list[DocumentInfo]
     total_documents: int
     total_chunks: int
+    workspace_usage: WorkspaceUsage
+    max_file_size_mb: int
 
 
 class IngestResponse(BaseModel):
@@ -32,6 +43,7 @@ class IngestResponse(BaseModel):
     total_chunks: int
     filenames: list[str]
     message: str
+    workspace_usage: WorkspaceUsage
 
 
 # --- Query ---
@@ -62,6 +74,10 @@ class QueryResponse(BaseModel):
     # One of: 'list', 'table', 'comparison', 'definition', 'instruction', 'factual'
     # None when no answer was generated (empty KB, chitchat, insufficient evidence).
     query_shape: Optional[str] = None
+    # None  → evidence check not run (chitchat / empty KB / insufficient evidence)
+    # False → all verifiable claims were supported by the retrieved sources
+    # True  → one or more claims could not be verified and were removed
+    hallucination_warning: Optional[bool] = None
     answer: str
     sources: list[RetrievedChunk]
     created_at: datetime = Field(default_factory=datetime.utcnow)

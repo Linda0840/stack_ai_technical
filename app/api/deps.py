@@ -24,10 +24,15 @@ def get_document_registry(request: Request) -> list:
     return request.app.state.document_registry
 
 
+def get_workspace_stats(request: Request) -> dict:
+    return request.app.state.workspace_stats
+
+
 def get_ingestion_service(request: Request) -> IngestionService:
     return IngestionService(
         vector_store=request.app.state.vector_store,
         bm25_index=request.app.state.bm25_index,
+        workspace_stats=request.app.state.workspace_stats,
     )
 
 

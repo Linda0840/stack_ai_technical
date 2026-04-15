@@ -414,6 +414,50 @@
     .kb-file-row .kb-meta {
       white-space: nowrap; color: var(--muted); font-size: .76rem;
     }
+    .kb-usage {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid #e8ecfd;
+    }
+    .kb-usage-label {
+      font-size: .72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .kb-usage-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .kb-usage-track {
+      flex: 1;
+      height: 6px;
+      border-radius: 999px;
+      background: #e8ecfd;
+      overflow: hidden;
+    }
+    .kb-usage-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--primary), #7c3aed);
+      width: 0%;
+      transition: width .25s ease;
+    }
+    .kb-usage-fill.warn { background: linear-gradient(90deg, #f59e0b, #ea580c); }
+    .kb-usage-fill.full { background: linear-gradient(90deg, #ef4444, #dc2626); }
+    .kb-usage-pct {
+      font-size: .8rem;
+      font-weight: 700;
+      color: var(--primary);
+      min-width: 3.2em;
+      text-align: right;
+      transition: color .2s;
+    }
+    .kb-usage-pct.warn { color: #c2410c; }
+    .kb-usage-pct.full { color: var(--danger); }
 
     footer {
       text-align: center;
@@ -471,12 +515,22 @@
     </button>
     <div class="kb-body" id="kb-body" role="region" aria-live="polite">
       <div class="kb-empty" id="kb-empty">No files uploaded yet.</div>
+      <div id="kb-file-rows"></div>
+      <div class="kb-usage" id="kb-usage">
+        <div class="kb-usage-label">Session capacity used</div>
+        <div class="kb-usage-row">
+          <div class="kb-usage-track" title="How much of this session’s indexing budget is in use">
+            <div class="kb-usage-fill" id="kb-usage-fill"></div>
+          </div>
+          <span class="kb-usage-pct" id="kb-usage-pct">—</span>
+        </div>
+      </div>
     </div>
 
     <div class="instructions">
       <h3>Instructions</h3>
       <div class="rule"><span class="rule-dot"></span>Please upload at least one PDF file. Other formats are not supported.</div>
-      <div class="rule"><span class="rule-dot"></span>Note that each file must be 20 MB or less.</div>
+      <div class="rule"><span class="rule-dot"></span>Note that each file must be <span id="file-size-limit">50</span> MB or less.</div>
     </div>
 
     <div class="drop-zone" id="drop-zone">
@@ -584,8 +638,8 @@
 <footer>RAG Agent API v0.1.0 &mdash; Powered by Mistral AI</footer>
 
 <script>
-  const MAX_FILE_SIZE_MB = 20;
-  const MAX_FILE_SIZE_B  = MAX_FILE_SIZE_MB * 1024 * 1024;
+  let MAX_FILE_SIZE_MB = 50;   // updated from backend on load
+  let MAX_FILE_SIZE_B  = MAX_FILE_SIZE_MB * 1024 * 1024;
   const API_BASE = '';   // same origin; change if running separately
 
   // ── state
@@ -608,6 +662,9 @@
   const kbBody         = document.getElementById('kb-body');
   const kbBadge        = document.getElementById('kb-badge');
   const kbEmpty        = document.getElementById('kb-empty');
+  const kbFileRows     = document.getElementById('kb-file-rows');
+  const kbUsageFill    = document.getElementById('kb-usage-fill');
+  const kbUsagePct     = document.getElementById('kb-usage-pct');
 
   const queryInput  = document.getElementById('query-input');
   const charCount   = document.getElementById('char-count');
@@ -632,8 +689,7 @@
   }
 
   function renderKbFiles(documents) {
-    // Remove old file rows (keep #kb-empty in the DOM)
-    kbBody.querySelectorAll('.kb-file-row').forEach(el => el.remove());
+    kbFileRows.innerHTML = '';
 
     if (!documents || documents.length === 0) {
       kbEmpty.style.display = 'block';
@@ -650,9 +706,33 @@
           <polyline points="14 2 14 8 20 8"/>
         </svg>
         <span class="kb-fname" title="${doc.filename}">${doc.filename}</span>
-        <span class="kb-meta">${doc.chunk_count} chunk${doc.chunk_count !== 1 ? 's' : ''} · ${relTime(doc.uploaded_at)}</span>`;
-      kbBody.appendChild(row);
+        <span class="kb-meta">${relTime(doc.uploaded_at)}</span>`;
+      kbFileRows.appendChild(row);
     });
+  }
+
+  function renderKbUsage(workspaceUsage) {
+    const pct = workspaceUsage && typeof workspaceUsage.percent_used === 'number'
+      ? Math.min(100, Math.max(0, workspaceUsage.percent_used))
+      : null;
+    if (pct === null) {
+      kbUsagePct.textContent = '—';
+      kbUsagePct.className = 'kb-usage-pct';
+      kbUsageFill.style.width = '0%';
+      kbUsageFill.className = 'kb-usage-fill';
+      return;
+    }
+    kbUsagePct.textContent = `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+    kbUsagePct.className = 'kb-usage-pct';
+    kbUsageFill.style.width = `${pct}%`;
+    kbUsageFill.className = 'kb-usage-fill';
+    if (pct >= 100) {
+      kbUsageFill.classList.add('full');
+      kbUsagePct.classList.add('full');
+    } else if (pct >= 80) {
+      kbUsageFill.classList.add('warn');
+      kbUsagePct.classList.add('warn');
+    }
   }
 
   async function loadSessionStatus() {
@@ -662,6 +742,15 @@
       const data = await res.json();          // DocumentListResponse
       currentFileCount = data.total_documents || 0;
       renderKbFiles(data.documents || []);
+      renderKbUsage(data.workspace_usage);
+      // Sync the per-file size limit from backend config so the UI never drifts
+      // out of sync when the server-side setting changes.
+      if (data.max_file_size_mb) {
+        MAX_FILE_SIZE_MB = data.max_file_size_mb;
+        MAX_FILE_SIZE_B  = MAX_FILE_SIZE_MB * 1024 * 1024;
+        const limitSpan = document.getElementById('file-size-limit');
+        if (limitSpan) limitSpan.textContent = MAX_FILE_SIZE_MB;
+      }
     } catch (_) {
       return;
     }

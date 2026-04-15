@@ -81,10 +81,11 @@ def _filename_label(filename: str) -> str:
 
 
 class IngestionService:
-   def __init__(self, vector_store: dict, bm25_index: dict):
+   def __init__(self, vector_store: dict, bm25_index: dict, workspace_stats: dict):
        # Injected shared stores (populated at startup via lifespan)
        self._vector_store = vector_store   # chunk_id -> {chunk, embedding}
        self._bm25_index = bm25_index       # chunk_id -> tokenised text (for BM25)
+       self._workspace_stats = workspace_stats  # {"total_chunks": int, "total_chars": int}
 
 
    # ------------------------------------------------------------------
@@ -166,11 +167,32 @@ class IngestionService:
            all_chunks.extend(chunks)
            logger.info("[ingest] queued %d chunks from %s", len(chunks), fname)
 
+       # ── Workspace capacity guard ──────────────────────────────────────────
+       current = self._workspace_stats["total_chunks"]
+       incoming = len(all_chunks)
+       cap = settings.max_workspace_chunks
+       if current + incoming > cap:
+           pct = int(current / cap * 100)
+           raise ValueError(
+               f"Session capacity exceeded: adding {incoming} chunk(s) would bring "
+               f"the workspace to {current + incoming}/{cap} chunks "
+               f"(currently at {pct}%). Please clear the workspace first."
+           )
+
        t0 = time.monotonic()
        await self._embed_and_store(all_chunks)
        logger.info(
            "[ingest] embed+store: %d total chunks  elapsed=%.3fs  total_pipeline=%.3fs",
            len(all_chunks), time.monotonic() - t0, time.monotonic() - pipeline_start,
+       )
+
+       # ── Update session-level usage counters ───────────────────────────────
+       self._workspace_stats["total_chunks"] += incoming
+       self._workspace_stats["total_chars"] += sum(len(c.text) for c in all_chunks)
+       logger.info(
+           "[ingest] workspace usage: %d/%d chunks (%.1f%%)",
+           self._workspace_stats["total_chunks"], cap,
+           self._workspace_stats["total_chunks"] / cap * 100,
        )
 
        return document_ids, len(all_chunks)

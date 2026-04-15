@@ -96,6 +96,44 @@ _PROMPT_TEMPLATES: dict[str, str] = {
 }
 
 
+def _extract_claims(text: str) -> list[tuple[int, str]]:
+    """
+    Walk the answer line-by-line and return (line_index, plain_claim) pairs
+    for lines that contain verifiable factual claims.
+
+    Skipped automatically
+    ---------------------
+    - Blank lines
+    - Markdown headers  (``### Heading``)
+    - Horizontal rules  (``---``, ``***``)
+    - Table-separator rows  (``| --- | --- |``)
+    - Lines whose plain text is shorter than 15 chars (fragments, labels)
+
+    Stripped before sending to the LLM
+    -----------------------------------
+    - List markers  ``- ``, ``* ``, ``1. ``
+    - Table pipe borders
+    - Bold/italic/strikethrough markers  ``**``, ``_``, ``~~``
+    """
+    claims: list[tuple[int, str]] = []
+    for idx, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip structural markdown — these are not factual claims.
+        if (re.match(r"^#{1,6}\s", stripped)
+                or re.match(r"^[-*_]{3,}$", stripped)
+                or re.match(r"^\|[-:\s|]+\|$", stripped)):
+            continue
+        # Strip formatting to expose the plain claim text for the LLM.
+        plain = re.sub(r"^[-*+]\s+|\d+\.\s+", "", stripped)   # list bullets
+        plain = re.sub(r"^\|(.+)\|$", r"\1", plain)            # table cells
+        plain = re.sub(r"\*{1,3}|_{1,3}|~~", "", plain).strip()
+        if len(plain) >= 15:
+            claims.append((idx, plain))
+    return claims
+
+
 def _classify_query_shape(query: str) -> str:
     """
     Classify a query into a formatting shape using regex heuristics.
@@ -295,7 +333,14 @@ class QueryService:
        logger.debug("Query shape: %s  query=%r", shape, request.query)
 
        reranked = await self._rerank(request.query, chunks, request.top_k)
-       answer = await self._generate(request.query, reranked, shape)
+       answer   = await self._generate(request.query, reranked, shape)
+
+       # Post-hoc hallucination filter: verify each claim in the answer
+       # against the retrieved chunks and remove unsupported ones.
+       if settings.evidence_check_enabled:
+           answer, hallucination_warning = await self._evidence_check(answer, reranked)
+       else:
+           hallucination_warning = False
 
        return QueryResponse(
            query=request.query,
@@ -303,6 +348,7 @@ class QueryService:
            intent_triggered_search=True,
            evidence_sufficient=True,
            query_shape=shape,
+           hallucination_warning=hallucination_warning,
            answer=answer,
            sources=reranked,
        )
@@ -632,3 +678,130 @@ class QueryService:
            return "Sorry, the answer could not be generated right now."
 
        return text.strip() or "Sorry, I had no answer text from the model."
+
+
+   async def _evidence_check(
+       self, answer: str, chunks: list[RetrievedChunk]
+   ) -> tuple[str, bool]:
+       """
+       Post-hoc hallucination filter.
+
+       Extracts verifiable claims from the answer (skipping markdown headers,
+       rules, and table separators), asks Mistral to classify each as
+       SUPPORTED or UNSUPPORTED against the retrieved source chunks, then
+       rebuilds the answer with unsupported lines removed.
+
+       Returns
+       -------
+       (filtered_answer, had_unsupported)
+           filtered_answer   – answer with unverifiable claims removed
+           had_unsupported   – True if at least one claim was removed
+       """
+       claim_pairs = _extract_claims(answer)
+       if not claim_pairs:
+           return answer, False
+
+       # Cap to avoid token overflow in the LLM call.
+       cap = settings.evidence_check_max_claims
+       claim_pairs = claim_pairs[:cap]
+       line_indices = [idx for idx, _ in claim_pairs]
+       claims      = [cl  for _, cl  in claim_pairs]
+
+       # Compact context — shorter than _generate so the prompt fits comfortably.
+       max_ctx_chars = 400
+       context = "\n\n".join(
+           f"[{c.filename}, p.{c.page_number}]\n{c.text[:max_ctx_chars]}"
+           for c in chunks
+       )
+       numbered = "\n".join(f"[{i}] {cl}" for i, cl in enumerate(claims))
+
+       def _call() -> str:
+           client = self._client()
+           resp = client.chat.complete(
+               model=settings.mistral_model,
+               temperature=0.0,
+               max_tokens=300,
+               messages=[
+                   SystemMessage(
+                       content=(
+                           "You are a strict fact-checker. "
+                           "Given source passages and numbered claims from an AI-generated answer, "
+                           "classify each claim as SUPPORTED (directly verifiable from the sources) "
+                           "or UNSUPPORTED (not verifiable, goes beyond, or contradicts the sources). "
+                           "Reply with ONLY a JSON array of strings in the same order as the claims. "
+                           'Example for 3 claims: ["SUPPORTED","UNSUPPORTED","SUPPORTED"]. '
+                           "No other text."
+                       )
+                   ),
+                   UserMessage(
+                       content=f"Sources:\n{context}\n\nClaims to verify:\n{numbered}"
+                   ),
+               ],
+           )
+           choice = resp.choices[0] if resp.choices else None
+           return _assistant_text(choice.message if choice else None)
+
+       try:
+           raw = await asyncio.to_thread(_call)
+       except Exception as exc:
+           logger.warning("Evidence check failed, returning original answer: %s", exc)
+           return answer, False
+
+       verdicts: list[str] = []
+       try:
+           cleaned = raw.strip()
+           if cleaned.startswith("```"):
+               cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+               cleaned = re.sub(r"\s*```$", "", cleaned)
+           start = cleaned.find("[")
+           end   = cleaned.rfind("]") + 1
+           if start >= 0 and end > start:
+               verdicts = [str(v).upper() for v in json.loads(cleaned[start:end])]
+       except (json.JSONDecodeError, ValueError, TypeError) as exc:
+           logger.debug("Could not parse evidence-check JSON: %s  raw=%r", exc, raw[:200])
+           return answer, False
+
+       if len(verdicts) != len(claims):
+           logger.debug(
+               "Evidence-check verdict count mismatch: got %d for %d claims",
+               len(verdicts), len(claims),
+           )
+           return answer, False
+
+       unsupported_indices = {
+           line_indices[i]
+           for i, v in enumerate(verdicts)
+           if v != "SUPPORTED"
+       }
+       removed = len(unsupported_indices)
+
+       if removed == 0:
+           logger.info("Evidence check: all %d claims supported.", len(claims))
+           return answer, False
+
+       logger.info(
+           "Evidence check: %d/%d claim(s) unsupported — removed from answer.",
+           removed, len(claims),
+       )
+
+       # Rebuild answer, dropping unsupported lines.
+       original_lines = answer.splitlines()
+       filtered_lines = [
+           line for idx, line in enumerate(original_lines)
+           if idx not in unsupported_indices
+       ]
+       filtered = "\n".join(filtered_lines).strip()
+
+       if not filtered:
+           filtered = (
+               "_No claims in the generated answer could be verified "
+               "against the retrieved source documents._"
+           )
+       else:
+           s = "s" if removed > 1 else ""
+           filtered += (
+               f"\n\n> **Evidence check:** {removed} claim{s} removed — "
+               "not directly supported by the retrieved sources."
+           )
+
+       return filtered, True
