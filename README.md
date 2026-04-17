@@ -139,15 +139,7 @@ After the answer is generated, a post-hoc evidence check extracts each verifiabl
 
 ### 6. Query Refusal Policies
 
-Word-boundary regex patterns detect three categories of sensitive content before any LLM or search call is made:
-
-| Category | Example triggers | Response |
-|---|---|---|
-| `pii` | `email`, `phone`, `ssn`, `address`, `passport` | Privacy notice; declines to look up personal data |
-| `legal` | `law`, `contract`, `lease`, `liability` | Legal disclaimer; refers to a qualified professional |
-| `medical` | `symptoms`, `diagnosis`, `treatment`, `pain` | Medical disclaimer; refers to a healthcare provider |
-
-The `refusal_category` field in the response lets the frontend render a distinct amber-coloured warning banner rather than a normal answer.
+Word-boundary regex patterns detect three categories of sensitive content — PII (e.g. personal identifiers), legal (e.g. contracts, liability), and medical (e.g. symptoms, diagnosis) — before any LLM or search call is made. A matched query is immediately refused with a category-specific message, and the frontend renders it as a distinct amber warning banner rather than a normal answer.
 
 ---
 
