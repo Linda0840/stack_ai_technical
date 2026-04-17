@@ -14,11 +14,12 @@ A Retrieval-Augmented Generation (RAG) backend built with [FastAPI](https://fast
    - [Re-ranking](#4-re-ranking)
    - [Generation](#5-generation)
 3. [System Safeguards](#system-safeguards)
-   - [No External Vector Database](#1-no-external-vector-database)
-   - [Insufficient Evidence Guard](#2-insufficient-evidence-guard)
-   - [Answer Shaping](#3-answer-shaping)
-   - [Hallucination Filter](#4-hallucination-filter)
-   - [Query Refusal Policies](#5-query-refusal-policies)
+   - [Workspace Capacity and Scalability](#1-workspace-capacity-and-scalability)
+   - [No External Vector Database](#2-no-external-vector-database)
+   - [Insufficient Evidence Guard](#3-insufficient-evidence-guard)
+   - [Answer Shaping](#4-answer-shaping)
+   - [Hallucination Filter](#5-hallucination-filter)
+   - [Query Refusal Policies](#6-query-refusal-policies)
 4. [UI](#ui)
 5. [API Reference](#api-reference)
 6. [Configuration](#configuration)
@@ -115,23 +116,28 @@ The top-`k` re-ranked chunks are assembled into a sourced context block and sent
 
 ## System Safeguards
 
-### 1. No External Vector Database
+### 1. Workspace Capacity and Scalability
+
+Each ingest request is bounded by a configurable per-request file count and per-file size limit. Across the session, total chunk usage is tracked against a ceiling — requests that would exceed it are rejected with a usage message. Setting the ceiling to `0` disables it for bulk runs. The in-process vector store scales comfortably to hundreds of thousands of chunks via a NumPy BLAS matrix multiply; beyond that, it can be swapped for [FAISS](https://github.com/facebookresearch/faiss) without changing any other part of the pipeline.
+
+### 2. No External Vector Database
+
 
 The entire knowledge base lives in two plain Python dicts held in `app.state` — no Redis, Pinecone, Qdrant, or FAISS dependency. For large indexes this in-process approach remains performant thanks to the NumPy BLAS matrix multiply for semantic search. A production path to horizontal scaling would swap the dict-based store for [FAISS](https://github.com/facebookresearch/faiss) without changing any other part of the pipeline.
 
-### 2. Insufficient Evidence Guard
+### 3. Insufficient Evidence Guard
 
 Before generating any answer, the pipeline checks the maximum hybrid score across all retrieved candidates. If no chunk clears the configured similarity threshold, the query is refused with an "insufficient evidence" message rather than risking a hallucinated answer synthesised from weakly related context.
 
-### 3. Answer Shaping
+### 4. Answer Shaping
 
 Structural keywords in the original query (e.g. "list", "compare", "how to") are matched by a zero-latency regex classifier before any LLM call, selecting a format-aware prompt template that steers the model toward the output type the user implicitly requested — bulleted list, comparison table, numbered steps, or free-form prose.
 
-### 4. Hallucination Filter
+### 5. Hallucination Filter
 
 After the answer is generated, a post-hoc evidence check extracts each verifiable claim, sends them to Mistral alongside the retrieved source passages, and removes any claim classified as `UNSUPPORTED`. A `> Evidence check: N claim(s) removed` footnote is appended and the `hallucination_warning` flag in the response is set to `true` when this occurs.
 
-### 5. Query Refusal Policies
+### 6. Query Refusal Policies
 
 Word-boundary regex patterns detect three categories of sensitive content before any LLM or search call is made:
 
