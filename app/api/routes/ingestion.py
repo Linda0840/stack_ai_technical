@@ -1,16 +1,15 @@
-# This endpoint:
+"""
+Ingestion routes: GET / POST / DELETE / ingestion pipeline.
 
+GET    — list every document indexed in the current session, along with
+         workspace capacity usage (total chunks vs. the configured ceiling).
+POST   — accept one or more PDF uploads, run them through the ingestion
+         pipeline (extract → chunk → embed → index), and return a summary.
+DELETE — wipe the entire in-memory knowledge base, resetting the session.
 
-# creates a POST route at /ingest
-# accepts one or more uploaded files
-# validates that files are present
-# validates that each file is a PDF
-# injects an IngestionService
-# passes the files to the service for processing
-# returns a structured IngestResponse
-
-
-
+All three endpoints share the same in-memory stores (vector store, BM25 index,
+document registry, workspace stats) injected via FastAPI dependencies.
+"""
 
 from datetime import datetime
 
@@ -75,7 +74,7 @@ async def list_documents(
        total_chunks=used,
        total_chars=workspace_stats["total_chars"],
        max_chunks=cap,
-       percent_used=round(used / cap * 100, 1),
+       percent_used=round(used / cap * 100, 1) if cap > 0 else 0.0,
    )
    return DocumentListResponse(
        documents=documents,
@@ -166,7 +165,7 @@ async def ingest_documents(
        total_chunks=used,
        total_chars=workspace_stats["total_chars"],
        max_chunks=cap,
-       percent_used=round(used / cap * 100, 1),
+       percent_used=round(used / cap * 100, 1) if cap > 0 else 0.0,
    )
    return IngestResponse(
        document_ids=document_ids,

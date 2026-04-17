@@ -1,29 +1,24 @@
-# This file intends to implement the ingestion pipeline:
-# - read uploaded PDF files
-# - extract text page by page
-# - split text into chunks
-# - generate embeddings
-# - store chunks and keyword tokens in memory
-
-
 """
 Ingestion service: PDF extraction → chunking → embedding → index storage.
 
-
-Considerations
---------------
-- Chunking strategy: fixed-size with overlap to avoid splitting mid-sentence.
- Overlap size (chunk_overlap) ensures context isn't lost at chunk boundaries.
-- Page-aware splitting: chunks are tagged with their source page number so
- citations stay accurate.
-- Embeddings are generated via Mistral's embedding API and stored in an
- in-memory vector store (dict keyed by chunk_id), since we cannot use third-party
- vector databases for this project.
+Pipeline
+--------
+1. Read   — load raw PDF bytes and enforce the per-file size limit.
+2. Extract — parse text page-by-page with pdfminer (CPU-bound; offloaded to
+             a thread pool via asyncio.to_thread so the event loop stays free).
+3. Chunk  — split each page into fixed-size, overlapping windows with
+             sentence-boundary preference to avoid mid-sentence cuts.
+             Every chunk carries its source page number for accurate citations.
+4. Embed  — call the Mistral embedding API in configurable batches embeddings.
+5. Index  — persist chunks in two parallel structures:
+             • vector store  (dict[chunk_id → {chunk, embedding}]) for cosine search
+             • BM25 index    (dict[chunk_id → token list])          for keyword search
 """
 
 
 import asyncio
 import logging
+import random
 import re
 import time
 import uuid
@@ -168,10 +163,11 @@ class IngestionService:
            logger.info("[ingest] queued %d chunks from %s", len(chunks), fname)
 
        # ── Workspace capacity guard ──────────────────────────────────────────
+       # cap=0 means unlimited (useful for eval / bulk-ingest runs).
        current = self._workspace_stats["total_chunks"]
        incoming = len(all_chunks)
        cap = settings.max_workspace_chunks
-       if current + incoming > cap:
+       if cap > 0 and current + incoming > cap:
            pct = int(current / cap * 100)
            raise ValueError(
                f"Session capacity exceeded: adding {incoming} chunk(s) would bring "
@@ -397,11 +393,15 @@ class IngestionService:
            logger.info("[embed] stored %d placeholder chunks — to use real embeddings set EMBED_MODE=real", len(chunks))
            return
 
-       client = Mistral(api_key=settings.mistral_api_key)
+       client = Mistral(api_key=settings.mistral_api_key, timeout_ms=timeout * 1000)
        logger.info(
            "[embed] REAL mode — starting Mistral API calls: %d chunks, batch_size=%d, timeout=%ds",
            len(chunks), batch_size, timeout,
        )
+
+       max_retries = settings.embed_max_retries
+       base_delay  = settings.embed_retry_base_delay
+       total_batches = (len(chunks) + batch_size - 1) // batch_size
 
        for i in range(0, len(chunks), batch_size):
            batch = chunks[i : i + batch_size]
@@ -421,35 +421,53 @@ class IngestionService:
                )
 
            batch_num = i // batch_size + 1
-           total_batches = (len(chunks) + batch_size - 1) // batch_size
            logger.info(
                "[embed] batch %d/%d — %d chunks (chars: %d)",
                batch_num, total_batches, len(batch),
                sum(len(t) for t in batch_texts),
            )
 
-           t0 = time.monotonic()
-           try:
-               response = await asyncio.wait_for(
-                   asyncio.to_thread(_call_embed),
-                   timeout=timeout,
-               )
-           except asyncio.TimeoutError:
-               logger.error(
-                   "[embed] batch %d/%d TIMED OUT after %ds — "
-                   "Mistral API did not respond. Check network/API key.",
-                   batch_num, total_batches, timeout,
-               )
-               raise RuntimeError(
-                   f"Embedding API timed out after {timeout}s on batch {batch_num}/{total_batches}. "
-                   "Check your network connection and Mistral API key."
-               )
-           except Exception as exc:
-               logger.exception(
-                   "[embed] batch %d/%d FAILED after %.3fs: %s",
-                   batch_num, total_batches, time.monotonic() - t0, exc,
-               )
-               raise
+           # ── Retry loop with exponential backoff for 429 rate-limit errors ──
+           response = None
+           for attempt in range(max_retries + 1):
+               t0 = time.monotonic()
+               try:
+                   response = await asyncio.wait_for(
+                       asyncio.to_thread(_call_embed),
+                       timeout=timeout,
+                   )
+                   break  # success — exit retry loop
+               except asyncio.TimeoutError:
+                   logger.error(
+                       "[embed] batch %d/%d TIMED OUT after %ds — "
+                       "Mistral API did not respond. Check network/API key.",
+                       batch_num, total_batches, timeout,
+                   )
+                   raise RuntimeError(
+                       f"Embedding API timed out after {timeout}s on batch "
+                       f"{batch_num}/{total_batches}. "
+                       "Check your network connection and Mistral API key."
+                   )
+               except Exception as exc:
+                   elapsed = time.monotonic() - t0
+                   exc_str = str(exc)
+                   is_rate_limit = "429" in exc_str or "rate_limit" in exc_str.lower()
+                   is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in exc_str.lower() or "ReadTimeout" in exc_str
+                   if (is_rate_limit or is_timeout) and attempt < max_retries:
+                       # Exponential backoff: base * 2^attempt, plus ±20% jitter
+                       delay = base_delay * (2 ** attempt) * (0.8 + 0.4 * random.random())
+                       reason = "rate-limited (429)" if is_rate_limit else "timed out"
+                       logger.warning(
+                           "[embed] batch %d/%d %s — retry %d/%d in %.1fs",
+                           batch_num, total_batches, reason, attempt + 1, max_retries, delay,
+                       )
+                       await asyncio.sleep(delay)
+                   else:
+                       logger.exception(
+                           "[embed] batch %d/%d FAILED after %.3fs: %s",
+                           batch_num, total_batches, elapsed, exc,
+                       )
+                       raise
 
            elapsed = time.monotonic() - t0
            logger.info(

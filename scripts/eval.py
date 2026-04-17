@@ -1,8 +1,5 @@
 """
-eval.py — RAG pipeline evaluator
-Usage: python eval.py --api_key YOUR_MISTRAL_KEY [--top_k 5]
-
-Edit the three paths in the CONFIG block below before each run.
+This file is used to evaluate the RAG pipeline.
 """
 
 import argparse
@@ -17,9 +14,9 @@ import httpx
 #  CONFIG — change these three lines between runs
 # ══════════════════════════════════════════════════════════════════════════════
 
-PDFS_DIR     = Path("data/eval/pdfs_sample_200")          # folder of PDFs to ingest
-EVAL_CSV     = Path("data/eval/200_random.csv") # queries + ground-truth answers
-RESULTS_FILE = Path("data/results/eval_200_results.csv")  # output
+PDFS_DIR     = Path("data/eval/pdfs_sample_500")          # folder of PDFs to ingest
+EVAL_CSV     = Path("data/eval/500_random.csv") # queries + ground-truth answers
+RESULTS_FILE = Path("data/results/eval_500_results.csv")  # output
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -46,7 +43,8 @@ def get_embeddings(texts: list[str], api_key: str) -> list[list[float]]:
     return [list(row.embedding) for row in resp.data]
 
 
-def llm_judge(query: str, ground_truth: str, agent_answer: str, api_key: str) -> float:
+def llm_judge(query: str, ground_truth: str, agent_answer: str, api_key: str,
+              max_retries: int = 3) -> float:
     """Ask Mistral to score the agent answer 0.0–10.0 against the ground truth."""
     from mistralai.client import Mistral
     from mistralai.client.models.systemmessage import SystemMessage
@@ -62,19 +60,28 @@ def llm_judge(query: str, ground_truth: str, agent_answer: str, api_key: str) ->
         "0  = wrong, hallucinated, or completely missing the point.\n"
         "Reply with ONLY a single number. No explanation."
     )
-    resp = client.chat.complete(
-        model="mistral-small-latest",
-        temperature=0.0,
-        max_tokens=8,
-        messages=[
-            SystemMessage(content="You are a strict RAG evaluator."),
-            UserMessage(content=prompt),
-        ],
-    )
-    try:
-        return float(resp.choices[0].message.content.strip())
-    except (ValueError, AttributeError):
-        return -1.0
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.complete(
+                model="mistral-small-latest",
+                temperature=0.0,
+                max_tokens=8,
+                messages=[
+                    SystemMessage(content="You are a strict RAG evaluator."),
+                    UserMessage(content=prompt),
+                ],
+            )
+            return float(resp.choices[0].message.content.strip())
+        except (ValueError, AttributeError):
+            return -1.0
+        except Exception as exc:
+            if attempt < max_retries - 1:
+                delay = 5 * (2 ** attempt)   # 5s, 10s, 20s
+                print(f"  Judge error (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {exc}")
+                time.sleep(delay)
+            else:
+                raise
+    return -1.0
 
 
 # ── ingestion ─────────────────────────────────────────────────────────────────
@@ -85,10 +92,10 @@ def clear_kb():
     print("Knowledge base cleared.")
 
 
-MAX_PDF_SIZE_MB = 20   # must match server's max_file_size_mb setting
+MAX_PDF_SIZE_MB = 50   # must match server's max_file_size_mb setting
 
 
-def ingest_pdfs(pdf_paths: list[Path], batch_size: int = 20) -> list[str]:
+def ingest_pdfs(pdf_paths: list[Path], batch_size: int = 10) -> list[str]:
     """
     Upload PDFs in batches of `batch_size` to respect the server's
     max_files_per_request limit.  Files exceeding MAX_PDF_SIZE_MB are skipped
@@ -119,7 +126,7 @@ def ingest_pdfs(pdf_paths: list[Path], batch_size: int = 20) -> list[str]:
     batches = [valid[i:i + batch_size] for i in range(0, len(valid), batch_size)]
     for b_idx, batch in enumerate(batches, 1):
         files = [("files", (p.name, p.read_bytes(), "application/pdf")) for p in batch]
-        r = httpx.post(INGEST_URL, files=files, timeout=300)
+        r = httpx.post(INGEST_URL, files=files, timeout=900)  # 15 min — real embeddings + retry backoff can be slow
         r.raise_for_status()
         data = r.json()
         total_chunks += data["total_chunks"]

@@ -1,6 +1,15 @@
-# config.py
-# This file contains the settings for the RAG Agent API.
-# It reads environment variables from the .env file, define app settings and Mistral API settings.
+"""
+Application settings.
+
+All values are read from environment variables (or a .env file) via
+pydantic-settings.  Each field has a sensible default so the app starts
+without any configuration, but production deployments should supply at
+minimum MISTRAL_API_KEY and set EMBED_MODE=real.
+
+The module-level get_settings() is memoised with @lru_cache so the Settings
+object is constructed exactly once per process lifetime; restart the server
+after changing .env values.
+"""
 
 from typing import Literal
 from functools import lru_cache
@@ -13,7 +22,7 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # Mistral
-    mistral_api_key: str = "CF2DvjIoshzasO0mtBkPj44fo2nXDwPk"
+    mistral_api_key: str = "wSFV43kzPBYKyr3YpDvRcFuka0MutNE2"
     mistral_model: str = "mistral-small-latest"
     mistral_embed_model: str = "mistral-embed"
 
@@ -41,18 +50,26 @@ class Settings(BaseSettings):
 
     # ── Scalability / safety limits ──────────────────────────────────────────
     # Hard cap on files accepted per /ingest request; guards against memory exhaustion.
-    max_files_per_request: int = 20
+    max_files_per_request: int = 50
     # Maximum PDF size accepted (bytes = mb * 1024^2); enforced after reading bytes.
     max_file_size_mb: int = 50
     # Maximum total chunks allowed across the entire session workspace.
     # Prevents unbounded memory growth; ~5 000 chunks ≈ several hundred pages of text.
     # Users see a friendly capacity percentage before hitting this ceiling.
-    max_workspace_chunks: int = 5000
+    max_workspace_chunks: int = 6000
     # Maximum candidates returned by hybrid search before re-ranking.
     # Keeps the reranker LLM prompt from exceeding the context window.
     max_retrieve_k: int = 50
     # Maximum chunks forwarded to the LLM reranker (subset of retrieve_k).
     max_rerank_chunks: int = 25
+
+    # ── Embedding retry / rate-limit handling ─────────────────────────────────
+    # Number of times to retry a single embedding batch after a 429 response.
+    # Set to 0 to disable retries (fail fast).
+    embed_max_retries: int = 6
+    # Base delay (seconds) for the first retry; doubles each attempt (exponential
+    # backoff) plus a small random jitter to avoid thundering-herd on 429s.
+    embed_retry_base_delay: float = 5.0
 
     # ── Evidence threshold ────────────────────────────────────────────────────
     # Minimum hybrid score (0.0–1.0) that at least one retrieved chunk must reach.

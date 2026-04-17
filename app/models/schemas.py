@@ -78,6 +78,9 @@ class QueryResponse(BaseModel):
     # False → all verifiable claims were supported by the retrieved sources
     # True  → one or more claims could not be verified and were removed
     hallucination_warning: Optional[bool] = None
+    # Set when the query was refused before any retrieval or generation.
+    # One of: 'pii' | 'legal' | 'medical' | None
+    refusal_category: Optional[str] = None
     answer: str
     sources: list[RetrievedChunk]
     created_at: datetime = Field(default_factory=datetime.utcnow)

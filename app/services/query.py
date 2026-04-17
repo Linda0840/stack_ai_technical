@@ -1,6 +1,26 @@
 """
-Query service: intent detection → query transformation → hybrid search →
-re-ranking → LLM generation.
+Query service: refusal check → intent detection → query transformation →
+hybrid search → re-ranking → LLM generation → hallucination filter.
+
+Pipeline
+--------
+1. Refusal check      — keyword-based PII / legal / medical guard; short-circuits
+                        before any LLM call when sensitive content is detected.
+2. Intent detection   — Mistral classifies the query as SEARCH or CHITCHAT;
+                        greetings and social messages are answered without retrieval.
+3. Query rewriting    — Mistral rewrites the query into a concise, retrieval-
+                        optimised form while preserving the original intent.
+4. Hybrid search      — combines cosine similarity (semantic) and BM25 (keyword)
+                        scores with configurable weights; computed via a single
+                        NumPy matrix multiply for speed.
+5. Evidence threshold — rejects queries whose best hybrid score falls below the
+                        configured minimum, avoiding hallucinated answers.
+6. Re-ranking         — Mistral scores each retrieved chunk for relevance and
+                        promotes the most pertinent ones to the top.
+7. LLM generation     — Mistral synthesises a cited answer from the top chunks
+                        using a format-aware prompt.
+8. Hallucination filter — a evidence check verifies each factual claim
+                          against the source chunks and removes unsupported ones.
 """
 
 
@@ -20,6 +40,7 @@ from mistralai.client.models.usermessage import UserMessage
 
 from app.core.config import get_settings
 from app.models.schemas import QueryRequest, QueryResponse, RetrievedChunk
+from app.services.refusal import check_refusal
 
 
 logger = logging.getLogger(__name__)
@@ -37,9 +58,11 @@ INSUFFICIENT_EVIDENCE_ANSWER = (
     "documents that cover this topic."
 )
 
-
+################################################################################
 # ── Answer-shaping: intent → format template ──────────────────────────────────
-#
+################################################################################
+
+
 # Patterns are checked in order; the first match wins.
 # "table" is before "comparison" so "compare in a table" → table, not comparison.
 # "list" is before "definition" so "list what X is" → list, not definition.
@@ -152,6 +175,10 @@ def _classify_query_shape(query: str) -> str:
     return "factual"
 
 
+################################################################################
+# ── Pipeline steps ────────────────────────────────────────────────────────────
+################################################################################
+
 def _tokenize(s: str) -> list[str]:
    return re.findall(r"[a-z0-9]+", s.lower())
 
@@ -210,7 +237,7 @@ def _bm25_scores_for_query(
    if avgdl == 0:
        avgdl = 1.0
 
-   # query
+   # query example
    # df: {"machine": count of how many _bm25_index chunks contain it,
    #      "learning": count of how many _bm25_index chunks contain it,
    #      "is": count of how many _bm25_index chunks contain it,
@@ -223,7 +250,7 @@ def _bm25_scores_for_query(
 
    scores: dict[str, float] = {}
 
-   # _bm25_index
+   # _bm25_index example
    # doc_tokens: {0: ["machine", "learning"],
    #              1: ["data", "science"],
    #              ...}
@@ -282,6 +309,18 @@ class QueryService:
 
 
    async def handle_query(self, request: QueryRequest) -> QueryResponse:
+       # ── Refusal policy: PII / legal / medical ────────────────────────────
+       # Check before any LLM or search call; zero latency on the happy path.
+       refusal_category, refusal_message = check_refusal(request.query)
+       if refusal_category is not None:
+           return QueryResponse(
+               query=request.query,
+               intent_triggered_search=False,
+               refusal_category=refusal_category,
+               answer=refusal_message,
+               sources=[],
+           )
+
        # Short-circuit before any LLM call when nothing has been ingested yet.
        if not self._vector_store:
            return QueryResponse(
@@ -309,7 +348,7 @@ class QueryService:
        # Refuse to generate an answer when the knowledge base contains nothing
        # relevant enough.  Checking the max hybrid score here (before reranking)
        # avoids two unnecessary LLM calls when the index simply doesn't cover
-       # the topic.  The hybrid score ∈ [0, 1] combines cosine similarity and
+       # the topic.  The hybrid score in range of [0, 1] combines cosine similarity and
        # normalised BM25, so a low ceiling means both signals are weak.
        best_score = max((c.score for c in chunks), default=0.0)
        if best_score < settings.min_similarity_threshold:
@@ -331,6 +370,11 @@ class QueryService:
        # still present when the shape is determined.
        shape = _classify_query_shape(request.query)
        logger.debug("Query shape: %s  query=%r", shape, request.query)
+
+        # ── Hybrid retrieval (BM25 + embeddings) ──────────────────────────────
+        # Hybrid retrieval provides good recall but may include
+        # irrelevant or weakly related chunks. Re-ranking refines these results by
+        # scoring each chunk with respect to the full query.
 
        reranked = await self._rerank(request.query, chunks, request.top_k)
        answer   = await self._generate(request.query, reranked, shape)
@@ -470,7 +514,7 @@ class QueryService:
 
        query_tokens = _tokenize(query)
        bm25_raw = _bm25_scores_for_query(query_tokens, self._bm25_index)
-       bm25_norm = _min_max_norm(bm25_raw)
+       bm25_norm = _min_max_norm(bm25_raw) # normalise BM25 scores to [0, 1]
 
        def _embed_query() -> list[float]:
            client = self._client()
@@ -509,6 +553,8 @@ class QueryService:
                row_norms = np.linalg.norm(emb_matrix, axis=1)
                valid = row_norms > 0
                if valid.any():
+                    # cosine similarity between query and chunk embeddings
+                    # cos(theta) = (A . B) / (|A| * |B|)
                    sem_scores[valid] = (emb_matrix[valid] @ q_vec) / (row_norms[valid] * q_norm)
 
        # ── BM25 scores ───────────────────────────────────────────────────────

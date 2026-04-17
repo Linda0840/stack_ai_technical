@@ -1,6 +1,7 @@
-# main.py
-# This file initializes the FastAPI application, sets up global configuration, 
-# prepares in-memory storage for retrieval, enables CORS, and registers API routes.
+"""
+This file initializes the FastAPI application, sets up global configuration, 
+prepares in-memory storage for retrieval, enables CORS, and registers API routes.
+"""
 
 from contextlib import asynccontextmanager  # used to define startup/shutdown logic
 import logging

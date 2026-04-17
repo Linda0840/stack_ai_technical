@@ -1,12 +1,15 @@
-# At a high level, this endpoint:
+"""
+Query route: POST / query pipeline.
 
+Accepts a natural-language question and an optional top_k parameter, then
+delegates to QueryService which runs the full RAG pipeline:
 
-# defines a POST route at /query
-# expects a structured request body of type QueryRequest
-# asks FastAPI to inject a QueryService
-# forwards the request to service.handle_query(request)
-# returns a structured QueryResponse
+    refusal check → intent detection → query transformation →
+    hybrid search → re-ranking → LLM generation → hallucination filter
 
+Returns a structured QueryResponse containing the answer, cited sources,
+and diagnostic flags (intent triggered, evidence sufficient, refusal category).
+"""
 
 from fastapi import APIRouter, Depends, status
 
@@ -19,16 +22,12 @@ from app.api.deps import get_query_service
 router = APIRouter(prefix="/query", tags=["Query"])
 
 
-
-
 @router.post(
    "",
    response_model=QueryResponse,
    status_code=status.HTTP_200_OK,
    summary="Query the knowledge base",
 )
-
-
 
 
 async def query_knowledge_base(
