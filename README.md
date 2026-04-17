@@ -109,16 +109,7 @@ Hybrid search prioritises recall over precision, so the top candidates are re-ra
 
 ### 5. Generation
 
-The top-`k` re-ranked chunks are assembled into a sourced context block and sent to Mistral with a **format-aware prompt** selected by a zero-latency regex classifier on the original query:
-
-| Detected shape | Trigger examples | Output format |
-|---|---|---|
-| `list` | "list all", "what are", "enumerate" | Markdown bulleted list with per-bullet citations |
-| `table` | "table", "tabulate", "spreadsheet" | Markdown table with a Source column |
-| `comparison` | "compare", "vs", "difference between" | Comparison table + prose summary |
-| `definition` | "what is", "define", "meaning of" | Concise definition + elaborating paragraph |
-| `instruction` | "how to", "steps to", "walk me through" | Numbered step-by-step list |
-| `factual` | *(default)* | Free-form cited prose |
+The top-`k` re-ranked chunks are assembled into a sourced context block and sent to Mistral with a **format-aware prompt**. Before the LLM call, a zero-latency regex classifier detects the structural intent of the original query — such as a list, table, comparison, definition, or step-by-step instruction — and selects the corresponding prompt template. Queries that match none of these patterns default to free-form cited prose.
 
 ---
 
@@ -252,6 +243,8 @@ Semantic similarity is stable across all runs (0.855–0.892), suggesting retrie
 - **Small query sample.** Each run evaluates only 20 queries, which may not be enough to produce statistically stable scores — a single unusually hard or easy question can noticeably shift the averages. Increasing the sample queries per run would reduce variance and give a more reliable picture of how retrieval quality changes as the knowledge base grows.
 
 - **Sampling bias.** The 20 queries are drawn at random from a larger query bank, so there is no guarantee they are uniformly distributed across the ingested PDFs. Some PDFs may be tested multiple times while others are never queried, meaning the scores reflect the difficulty of that particular sample rather than the pipeline's performance across the full corpus.
+
+- **Scalability not yet stress-tested.** Scores remain stable up to 500 PDFs with no noticeable degradation in semantic similarity or judge score, which is encouraging. However, it is not yet clear where the pipeline's retrieval quality starts to decline — if at all — as the knowledge base grows further. Extending the evaluation to 1 000 PDFs would help establish whether the in-process vector store and hybrid search remain effective at larger scale, or whether an approximate nearest-neighbour index becomes necessary.
 
 ---
 
