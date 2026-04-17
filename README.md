@@ -14,11 +14,11 @@ A Retrieval-Augmented Generation (RAG) backend built with [FastAPI](https://fast
    - [Re-ranking](#4-re-ranking)
    - [Generation](#5-generation)
 3. [System Safeguards](#system-safeguards)
-   - [No External Vector Database](#no-external-vector-database)
-   - [Insufficient Evidence Guard](#insufficient-evidence-guard)
-   - [Answer Shaping](#answer-shaping)
-   - [Hallucination Filter](#hallucination-filter)
-   - [Query Refusal Policies](#query-refusal-policies)
+   - [No External Vector Database](#1-no-external-vector-database)
+   - [Insufficient Evidence Guard](#2-insufficient-evidence-guard)
+   - [Answer Shaping](#3-answer-shaping)
+   - [Hallucination Filter](#4-hallucination-filter)
+   - [Query Refusal Policies](#5-query-refusal-policies)
 4. [UI](#ui)
 5. [API Reference](#api-reference)
 6. [Configuration](#configuration)
@@ -77,8 +77,6 @@ Text is extracted page-by-page using [pdfplumber](https://github.com/jsvine/pdfp
 
 Chunks are embedded in batches using Mistral's `mistral-embed` model. Each chunk's text is prefixed with the document's filename as a label, helping the embedding model distinguish documents with similar body text. Embeddings are stored in a plain in-memory dict alongside a parallel BM25 token index for keyword search.
 
----
-
 ### 2. Query Processing
 
 `POST /api/v1/query` runs the following sequence of steps:
@@ -95,8 +93,6 @@ Refusal check → Intent detection → Query transformation
 
 **Query transformation** rewrites the user's question into a short, standalone retrieval phrase — removing filler words and resolving pronouns — while preserving the original phrasing for answer-shape detection downstream.
 
----
-
 ### 3. Hybrid Search
 
 The rewritten query is scored against all indexed chunks using a weighted sum of two signals:
@@ -107,13 +103,9 @@ hybrid_score = 0.7 × cosine_similarity + 0.3 × BM25
 
 Semantic search captures paraphrase and synonyms but struggles with rare proper nouns or exact quoted phrases; BM25 is the inverse. The hybrid fusion benefits from the strengths of both. Cosine similarity is computed via a single NumPy BLAS matrix-vector multiply rather than individual dot products, giving a significant speedup over large indexes.
 
----
-
 ### 4. Re-ranking
 
 Hybrid search prioritises recall over precision, so the top candidates are re-ranked by a Mistral chat call that scores each retrieved passage 0–10 for relevance to the original query. Candidates are then re-sorted by that score before the top `top_k` are forwarded to generation. If the LLM call fails, the original hybrid order is preserved.
-
----
 
 ### 5. Generation
 
@@ -132,31 +124,23 @@ The top-`k` re-ranked chunks are assembled into a sourced context block and sent
 
 ## System Safeguards
 
-### No External Vector Database
+### 1. No External Vector Database
 
 The entire knowledge base lives in two plain Python dicts held in `app.state` — no Redis, Pinecone, Qdrant, or FAISS dependency. For large indexes this in-process approach remains performant thanks to the NumPy BLAS matrix multiply for semantic search. A production path to horizontal scaling would swap the dict-based store for [FAISS](https://github.com/facebookresearch/faiss) without changing any other part of the pipeline.
 
----
-
-### Insufficient Evidence Guard
+### 2. Insufficient Evidence Guard
 
 Before generating any answer, the pipeline checks the maximum hybrid score across all retrieved candidates. If no chunk clears the configured similarity threshold, the query is refused with an "insufficient evidence" message rather than risking a hallucinated answer synthesised from weakly related context.
 
----
-
-### Answer Shaping
+### 3. Answer Shaping
 
 Structural keywords in the original query (e.g. "list", "compare", "how to") are matched by a zero-latency regex classifier before any LLM call, selecting a format-aware prompt template that steers the model toward the output type the user implicitly requested — bulleted list, comparison table, numbered steps, or free-form prose.
 
----
-
-### Hallucination Filter
+### 4. Hallucination Filter
 
 After the answer is generated, a post-hoc evidence check extracts each verifiable claim, sends them to Mistral alongside the retrieved source passages, and removes any claim classified as `UNSUPPORTED`. A `> Evidence check: N claim(s) removed` footnote is appended and the `hallucination_warning` flag in the response is set to `true` when this occurs.
 
----
-
-### Query Refusal Policies
+### 5. Query Refusal Policies
 
 Word-boundary regex patterns detect three categories of sensitive content before any LLM or search call is made:
 
@@ -174,11 +158,11 @@ The `refusal_category` field in the response lets the frontend render a distinct
 
 A single-page chat interface is served from `static/index.html` at the application root (`GET /`). It is pure HTML + CSS + Vanilla JS — no framework or build step required.
 
-**Workspace management**
+### Workspace Management
 
 The upload panel enforces server-side constraints on the client before any network call: files are rejected immediately if they are not PDFs or exceed the per-file size limit synced from the backend at load time. A collapsible *Knowledge Base* panel lists every indexed file with its relative upload time, and a colour-coded capacity bar (green → amber at 80% → red at 100%) shows how much of the session's indexing budget is in use. A *Clear Session* button wipes the entire knowledge base, with a confirmation hint warning that the action is irreversible.
 
-**Query experience**
+### Query Experience
 
 The query panel renders LLM answers as styled markdown via [marked.js](https://marked.js.org/), including tables, code blocks, and bulleted lists. Cited sources appear below the answer as filename-and-page chips. An *Advanced Settings* disclosure exposes a top-k slider (1–20 sources) so users can trade answer depth for speed. Sensitive-query refusals are surfaced as a distinct amber banner labelled by category (Privacy / Legal / Medical) rather than blending into the normal answer area.
 
@@ -244,7 +228,7 @@ python scripts/eval.py \
 
 Configure `PDFS_DIR`, `EVAL_CSV`, and `RESULTS_FILE` at the top of the script to point at your dataset.
 
-**Results**
+### Results
 
 Each run evaluates 20 randomly sampled queries against knowledge bases of increasing size (100–500 PDFs). Semantic similarity is measured as cosine similarity between Mistral embeddings of the ground-truth and agent answers (0–1). LLM judge score is assigned by Mistral on a 0–10 scale. Semantic similarity is scaled ×10 in the chart below to share the same axis with the judge score.
 
@@ -261,9 +245,9 @@ Each run evaluates 20 randomly sampled queries against knowledge bases of increa
 | 500 PDFs | 0.8901 | 8.03 / 10 | 20% |
 | **Average** | **0.8717** | **7.93 / 10** | **17%** |
 
-Semantic similarity is stable across all runs (0.855–0.892), suggesting the retrieval and embedding quality is robust to knowledge-base size. The LLM judge score dips at 300 PDFs (6.78) before recovering, likely reflecting a harder query sample rather than a structural degradation in retrieval. Insufficient-evidence refusals were zero across all runs, indicating the index consistently surfaced at least one relevant chunk for every query tested.
+Semantic similarity is stable across all runs (0.855–0.892), suggesting retrieval and embedding quality is robust to knowledge-base size. The LLM judge score dips at 300 PDFs (6.78) before recovering, likely reflecting a harder query sample rather than a structural degradation in retrieval. Insufficient-evidence refusals were zero across all runs, indicating the index consistently surfaced at least one relevant chunk for every query tested.
 
-**Limitations**
+### Limitations
 
 - **Small query sample.** Each run evaluates only 20 queries, which may not be enough to produce statistically stable scores — a single unusually hard or easy question can noticeably shift the averages. Increasing the sample queries per run would reduce variance and give a more reliable picture of how retrieval quality changes as the knowledge base grows.
 
