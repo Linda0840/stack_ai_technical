@@ -225,6 +225,22 @@ python scripts/eval.py \
 
 Configure `PDFS_DIR`, `EVAL_CSV`, and `RESULTS_FILE` at the top of the script to point at your dataset.
 
+### Dataset
+
+Evaluation data is drawn from [Open RAG Bench](https://github.com/vectara/open-rag-bench), an open-source multimodal benchmark created by [Vectara](https://huggingface.co/datasets/vectara/open_ragbench) — one of the few public datasets for RAG systems that starts from raw PDFs. The original dataset contains ~400 Arxiv articles paired with 3 000 query/answer pairs. An additional ~600 distractor PDFs (with no associated queries) were added to test retrieval precision under a noisier knowledge base. All files are available on [Google Drive](https://drive.google.com/drive/u/0/folders/18q_zokgsrMsL-Xfx4OcYST1DLb8TNzYY).
+
+**Generating a sample** — after downloading the files from Google Drive, use `scripts/eval_sampling.py` to randomly sample a subset of PDFs and their associated queries:
+
+```bash
+# Sample 500 PDFs and 20 queries (defaults)
+python scripts/eval_sampling.py
+
+# Custom sample sizes
+python scripts/eval_sampling.py --n_pdfs 800 --n_queries 50
+```
+
+This copies the sampled PDFs into a new folder (`pdfs_sample_<N>`) and writes a filtered query CSV (`<N>_random.csv`), both ready to pass directly to `scripts/eval.py`.
+
 ### Results
 
 Each run evaluates 20 randomly sampled queries against knowledge bases of increasing size (100–500 PDFs). Semantic similarity is measured as cosine similarity between Mistral embeddings of the ground-truth and agent answers (0–1). LLM judge score is assigned by Mistral on a 0–10 scale. Semantic similarity is scaled ×10 in the chart below to share the same axis with the judge score.
