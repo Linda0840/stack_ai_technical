@@ -178,7 +178,7 @@ Full interactive documentation is available at `http://localhost:8000/docs` (Swa
 ```bash
 # 1. Clone and enter the repo
 git clone <repo-url>
-cd stack_ai_technical
+cd pdf
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
