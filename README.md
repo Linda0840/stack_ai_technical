@@ -178,7 +178,7 @@ Full interactive documentation is available at `http://localhost:8000/docs` (Swa
 ```bash
 # 1. Clone and enter the repo
 git clone <repo-url>
-cd pdf
+cd pdf_ingestor_AI
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
