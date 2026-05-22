@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # Mistral
-    mistral_api_key: str = "wSFV43kzPBYKyr3YpDvRcFuka0MutNE2"
+    mistral_api_key: str = ""
     mistral_model: str = "mistral-small-latest"
     mistral_embed_model: str = "mistral-embed"
 
